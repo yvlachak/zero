@@ -1493,6 +1493,23 @@ assert.equal(webDevPlan.localRuntime.productionLikeImports, true);
 assert.equal(webDevPlan.localRuntime.providerSpecificDeployment, false);
 assert.equal(webDevPlan.localRuntime.capabilityRestrictions.filesystem, "denied");
 
+// This allowlist is intentionally scoped to the curated command-contract
+// diagnostic sample below. It does not attempt to enforce explain coverage for
+// every public diag_code entry yet. PAR100 and NAM003 should be removed after
+// rebasing on the diagnostic explain coverage patch that adds entries for them.
+const explainNotYetCovered = {
+  ABI001: "C ABI diagnostics are emitted in command-contract fixtures but explain coverage is pending",
+  BLD002: "build/input diagnostics are emitted in command-contract fixtures but explain coverage is pending",
+  ERR001: "raise-without-raises diagnostics are emitted in command-contract fixtures but explain coverage is pending",
+  FLD002: "shape field initialization diagnostics are emitted in command-contract fixtures but explain coverage is pending",
+  IMP001: "import diagnostics are emitted in command-contract fixtures but explain coverage is pending",
+  NAM003: "unknown-name diagnostics are emitted in command-contract fixtures but explain coverage is pending on this branch",
+  NAM004: "call arity diagnostics are emitted in command-contract fixtures but explain coverage is pending",
+  OWN001: "ownership diagnostics are emitted in command-contract fixtures but explain coverage is pending",
+  PAR100: "parser diagnostics are emitted in command-contract fixtures but explain coverage is pending on this branch",
+  TYP002: "type mismatch diagnostics are emitted in command-contract fixtures but explain coverage is pending",
+};
+
 const diagnostics = [
   ["PAR100", ["check", "--json", "conformance/check/fail/parse-missing-brace.0"]],
   ["NAM003", ["check", "--json", "conformance/check/fail/unknown-name.0"]],
@@ -1538,6 +1555,42 @@ const diagnostics = [
     relatedCount: diagnostic.related.length,
   };
 });
+
+const diagnosticCodes = new Set(diagnostics.map((diagnostic) => diagnostic.code));
+for (const [code, reason] of Object.entries(explainNotYetCovered)) {
+  assert.equal(typeof reason, "string");
+  assert(reason.length > 0, `${code} explain allowlist entry must include a reason`);
+  assert(diagnosticCodes.has(code), `${code} explain allowlist entry is not exercised by command-contract diagnostics`);
+}
+for (const code of diagnosticCodes) {
+  const explained = zero(["explain", "--json", code], { allowFailure: true });
+  if (explained.code !== 0) {
+    assert(
+      Object.hasOwn(explainNotYetCovered, code),
+      `${code} is emitted by command-contract diagnostics but zero explain --json ${code} failed and the code is not allowlisted`
+    );
+    continue;
+  }
+  assert(
+    !Object.hasOwn(explainNotYetCovered, code),
+    `${code} is now covered by zero explain --json and should be removed from explainNotYetCovered`
+  );
+  const explanation = JSON.parse(explained.stdout);
+  assert.equal(explanation.schemaVersion, 1);
+  assert.equal(explanation.code, code);
+  assert.equal(typeof explanation.title, "string");
+  assert(explanation.title.length > 0, `${code} explain title must be non-empty`);
+  assert.equal(typeof explanation.summary, "string");
+  assert(explanation.summary.length > 0, `${code} explain summary must be non-empty`);
+  assert.equal(typeof explanation.why, "string");
+  assert(explanation.why.length > 0, `${code} explain why must be non-empty`);
+  assert.equal(typeof explanation.repair.id, "string");
+  assert(explanation.repair.id.length > 0, `${code} explain repair.id must be non-empty`);
+  assert.equal(typeof explanation.repair.summary, "string");
+  assert(explanation.repair.summary.length > 0, `${code} explain repair.summary must be non-empty`);
+  assert.equal(typeof explanation.examples.bad, "string");
+  assert.equal(typeof explanation.examples.good, "string");
+}
 
 const graph = json(["graph", "--json", "--target", "linux-musl-x64", "examples/memory-package"]).body;
 assert.equal(graph.schemaVersion, 1);
