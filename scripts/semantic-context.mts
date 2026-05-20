@@ -2,7 +2,7 @@
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
 
@@ -67,12 +67,21 @@ type Diagnostic = {
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(scriptDir, "..");
-const contextDir = path.join(repoRoot, ".zero/context");
+const configuredContextDir = process.env.ZERO_CONTEXT_DIR;
+const contextDir = configuredContextDir ? path.resolve(repoRoot, configuredContextDir) : path.join(repoRoot, ".zero/context");
 const nodesDir = path.join(contextDir, "nodes");
 const indexesDir = path.join(contextDir, "indexes");
 const rootPath = path.join(contextDir, "root.json");
 const sourceIndexPath = path.join(indexesDir, "source-index.json");
-const sourceIndexDisplayPath = ".zero/context/indexes/source-index.json";
+
+function displayPath(filePath: string) {
+  const relative = path.relative(repoRoot, filePath);
+  if (!relative.startsWith("..") && !path.isAbsolute(relative)) return relative.split(path.sep).join("/");
+  return filePath.split(path.sep).join("/");
+}
+
+const contextDisplayPath = displayPath(contextDir);
+const sourceIndexDisplayPath = displayPath(sourceIndexPath);
 
 function usage(): never {
   console.error(`Usage:
@@ -264,7 +273,7 @@ function commandInit() {
     schemaVersion: 1,
     mode: "context-init",
     contextRoot: root.contextRoot,
-    storage: ".zero/context",
+    storage: contextDisplayPath,
   }, null, 2));
 }
 
@@ -361,7 +370,7 @@ function commandVerify() {
     diagnostics.push({
       code: "CTX-ROOT",
       message: "context root hash does not match canonical payload",
-      path: ".zero/context/root.json",
+      path: displayPath(rootPath),
       expected: root.contextRoot,
       actual: expectedRoot,
     });
@@ -382,7 +391,7 @@ function commandVerify() {
   }
   for (const filename of existsSync(nodesDir) ? readdirSync(nodesDir).filter((item) => item.endsWith(".json")) : []) {
     const hash = `sha256:${filename.slice(0, -".json".length)}`;
-    if (!root.nodes.includes(hash)) diagnostics.push({ code: "CTX-ORPHAN", message: "node file is not referenced by root", path: path.join(".zero/context/nodes", filename), hash });
+    if (!root.nodes.includes(hash)) diagnostics.push({ code: "CTX-ORPHAN", message: "node file is not referenced by root", path: displayPath(path.join(nodesDir, filename)), hash });
   }
   console.log(JSON.stringify({
     schemaVersion: 1,
@@ -394,10 +403,14 @@ function commandVerify() {
   if (diagnostics.length > 0) process.exitCode = 1;
 }
 
-const { command, options } = parseArgs(process.argv.slice(2));
+export function main(argv = process.argv.slice(2)) {
+  const { command, options } = parseArgs(argv);
+  if (command === "init") commandInit();
+  else if (command === "capture-repair") commandCaptureRepair(options.source);
+  else if (command === "project") commandProject(options.source);
+  else if (command === "verify") commandVerify();
+  else usage();
+}
 
-if (command === "init") commandInit();
-else if (command === "capture-repair") commandCaptureRepair(options.source);
-else if (command === "project") commandProject(options.source);
-else if (command === "verify") commandVerify();
-else usage();
+const entryPoint = process.argv[1] ? pathToFileURL(path.resolve(process.argv[1])).href : "";
+if (import.meta.url === entryPoint) main();
