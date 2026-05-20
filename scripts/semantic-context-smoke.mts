@@ -52,6 +52,18 @@ function tempJson(name: string, value: any) {
   return target;
 }
 
+function snapshotPath(dir: string, hash: string) {
+  return path.join(dir, "roots", `${hash.replace("sha256:", "")}.json`);
+}
+
+function readRootPointer(dir = storage) {
+  return JSON.parse(readFileSync(path.join(dir, "root.json"), "utf8"));
+}
+
+function readRootSnapshot(dir = storage, hash = readRootPointer(dir).currentRoot) {
+  return JSON.parse(readFileSync(snapshotPath(dir, hash), "utf8"));
+}
+
 function captureContext(dir: string) {
   resetStorage(dir);
   run(["init"], { storage: dir });
@@ -59,9 +71,9 @@ function captureContext(dir: string) {
 }
 
 function mutateResidualSummary(dir: string, summary: string) {
-  const rootPath = path.join(dir, "root.json");
   const indexPath = path.join(dir, "indexes/source-index.json");
-  const root = JSON.parse(readFileSync(rootPath, "utf8"));
+  const pointer = readRootPointer(dir);
+  const root = readRootSnapshot(dir);
   const oldHash = root.nodes[0];
   const oldNodePath = path.join(dir, "nodes", `${oldHash.replace("sha256:", "")}.json`);
   const node = JSON.parse(readFileSync(oldNodePath, "utf8"));
@@ -73,8 +85,11 @@ function mutateResidualSummary(dir: string, summary: string) {
   root.nodes = [node.hash];
   root.activeNodes = [node.hash];
   root.supersededNodes = root.supersededNodes ?? [];
-  root.contextRoot = rootHashForSourceIndex(root.nodes, indexPath.split(path.sep).join("/"), root.supersededNodes);
-  writeFileSync(rootPath, `${JSON.stringify(root, null, 2)}\n`);
+  root.contextRoot = rootHashForSourceIndex(root.nodes, indexPath.split(path.sep).join("/"), root.supersededNodes, root.parentRoot, root.reason);
+  writeFileSync(snapshotPath(dir, root.contextRoot), `${JSON.stringify(root, null, 2)}\n`);
+  pointer.currentRoot = root.contextRoot;
+  pointer.rootPath = snapshotPath(dir, root.contextRoot).split(path.sep).join("/");
+  writeFileSync(path.join(dir, "root.json"), `${JSON.stringify(pointer, null, 2)}\n`);
   const index = JSON.parse(readFileSync(indexPath, "utf8"));
   index.sources[node.sourceAnchor.path] = [node.hash];
   writeFileSync(indexPath, `${JSON.stringify(index, null, 2)}\n`);
@@ -89,6 +104,21 @@ try {
   assert.equal(init.mode, "context-init");
   assert.equal(init.storage, storage);
   assert.match(init.contextRoot, /^sha256:[0-9a-f]{64}$/);
+  assert.equal(init.currentRoot, init.contextRoot);
+  assert.equal(init.previousRoot, null);
+  assert.match(init.rootPath, /roots\/[0-9a-f]{64}\.json$/);
+  const initPointer = readRootPointer();
+  assert.equal(initPointer.currentRoot, init.contextRoot);
+  assert.equal(initPointer.previousRoot, null);
+  assert.equal(existsSync(snapshotPath(storage, init.contextRoot)), true);
+  const initSnapshot = readRootSnapshot(storage, init.contextRoot);
+  assert.equal(initSnapshot.contextRoot, init.contextRoot);
+  assert.equal(initSnapshot.parentRoot, null);
+  assert.equal(initSnapshot.reason, "init");
+  assert.deepEqual(initSnapshot.activeNodes, []);
+  assert.deepEqual(initSnapshot.supersededNodes, []);
+  assert.deepEqual(initSnapshot.nodes, []);
+  assert.equal(initSnapshot.createdAt, null);
 
   const capture = run(["capture-repair", "--source", source]);
   assert.equal(capture.mode, "context-capture-repair");
@@ -98,11 +128,20 @@ try {
   assert.deepEqual(capture.node.parents, []);
   assert.equal(capture.node.lifecycle.state, "active");
   assert.match(capture.node.hash, /^sha256:[0-9a-f]{64}$/);
+  const firstCapturePointer = readRootPointer();
+  const firstCaptureSnapshot = readRootSnapshot(storage, firstCapturePointer.currentRoot);
+  assert.notEqual(firstCapturePointer.currentRoot, init.contextRoot);
+  assert.equal(firstCapturePointer.previousRoot, init.contextRoot);
+  assert.equal(firstCaptureSnapshot.parentRoot, init.contextRoot);
+  assert.equal(firstCaptureSnapshot.reason, "capture-repair");
+  assert.deepEqual(firstCaptureSnapshot.activeNodes, [capture.node.hash]);
 
   const secondCapture = run(["capture-repair", "--source", source]);
   assert.equal(secondCapture.action, "unchanged");
   assert.equal(secondCapture.node.hash, capture.node.hash);
-  const repeatedRoot = JSON.parse(readFileSync(path.join(storage, "root.json"), "utf8"));
+  const repeatedPointer = readRootPointer();
+  assert.equal(repeatedPointer.currentRoot, firstCapturePointer.currentRoot);
+  const repeatedRoot = readRootSnapshot();
   assert.deepEqual(repeatedRoot.nodes, [capture.node.hash]);
   assert.deepEqual(repeatedRoot.activeNodes, [capture.node.hash]);
   assert.deepEqual(repeatedRoot.supersededNodes, []);
@@ -222,6 +261,8 @@ try {
   assert.equal(previewCapture.captured.length, 1);
   assert.equal(previewCapture.captured[0].action, "added");
   assert.equal(previewCapture.captured[0].nodeId, "ctx:repair-memory:typ009:make-binding-mutable");
+  const previewRootPointer = readRootPointer();
+  const previewRootSnapshot = readRootSnapshot(storage, previewRootPointer.currentRoot);
   const previewVerify = run(["verify", "--json"]);
   assert.equal(previewVerify.ok, true);
   assert.equal(previewVerify.nodes[0].preconditions[0].actual, "let");
@@ -259,10 +300,17 @@ try {
   assert.equal(lifecycleCapture.captured[0].action, "superseded");
   assert.notEqual(lifecycleCapture.captured[0].hash, previewCapture.captured[0].hash);
 
-  const lifecycleRoot = JSON.parse(readFileSync(path.join(storage, "root.json"), "utf8"));
+  const lifecycleRootPointer = readRootPointer();
+  assert.notEqual(lifecycleRootPointer.currentRoot, previewRootPointer.currentRoot);
+  assert.equal(lifecycleRootPointer.previousRoot, previewRootPointer.currentRoot);
+  const lifecycleRoot = readRootSnapshot(storage, lifecycleRootPointer.currentRoot);
+  assert.equal(lifecycleRoot.parentRoot, previewRootPointer.currentRoot);
+  assert.equal(lifecycleRoot.reason, "capture-fix-plan");
   assert.deepEqual(lifecycleRoot.nodes, [lifecycleCapture.captured[0].hash]);
   assert.deepEqual(lifecycleRoot.activeNodes, [lifecycleCapture.captured[0].hash]);
   assert.deepEqual(lifecycleRoot.supersededNodes, [previewCapture.captured[0].hash]);
+  assert.equal(existsSync(snapshotPath(storage, previewRootPointer.currentRoot)), true);
+  assert.deepEqual(previewRootSnapshot.activeNodes, [previewCapture.captured[0].hash]);
   const lifecycleIndex = JSON.parse(readFileSync(path.join(storage, "indexes/source-index.json"), "utf8"));
   assert.deepEqual(lifecycleIndex.sources[source], [lifecycleCapture.captured[0].hash]);
 
@@ -289,6 +337,16 @@ try {
   assert.equal(lifecycleVerifyWithSuperseded.ok, true);
   assert.equal(lifecycleVerifyWithSuperseded.checkedNodes, 2);
   assert(lifecycleVerifyWithSuperseded.nodes.some((node: any) => node.hash === previewCapture.captured[0].hash && node.lifecycle.state === "superseded"));
+
+  const rootHistoryDiff = run(["diff", "--from", snapshotPath(storage, previewRootPointer.currentRoot), "--to", snapshotPath(storage, lifecycleRootPointer.currentRoot), "--json"]);
+  assert.equal(rootHistoryDiff.ok, true);
+  assert.equal(rootHistoryDiff.summary.changed, 1);
+  assert.equal(rootHistoryDiff.summary.lifecycleChanged, 1);
+  assert(rootHistoryDiff.nodes.lifecycleChanged.some((node: any) =>
+    node.hash === previewCapture.captured[0].hash &&
+    node.from.state === "active" &&
+    node.to.state === "superseded"
+  ));
 
   resetStorage();
   const noPreviewPlan = tempJson("no-preview-plan.json", {

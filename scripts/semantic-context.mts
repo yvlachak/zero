@@ -48,12 +48,27 @@ type SemanticNode = {
   hash: string;
 };
 
-type RootFile = {
+type RootReason = "init" | "capture-repair" | "capture-fix-plan" | "manual";
+
+type RootSnapshot = {
   schemaVersion: 1;
   contextRoot: string;
+  parentRoot: string | null;
+  reason: RootReason;
+  activeNodes: string[];
+  supersededNodes: string[];
   nodes: string[];
-  activeNodes?: string[];
-  supersededNodes?: string[];
+  createdAt: null;
+  indexes: {
+    sourceIndex: string;
+  };
+};
+
+type RootPointer = {
+  schemaVersion: 1;
+  currentRoot: string;
+  previousRoot: string | null;
+  rootPath: string;
   indexes: {
     sourceIndex: string;
   };
@@ -118,7 +133,7 @@ type LoadedContext = {
   contextDir: string;
   rootPath: string;
   nodesDir: string;
-  root: RootFile | null;
+  root: RootSnapshot | null;
   nodesById: Map<string, SemanticNode>;
   nodesByHash: Map<string, SemanticNode>;
   diagnostics: Diagnostic[];
@@ -167,6 +182,7 @@ function displayPath(filePath: string) {
 
 let contextDir = "";
 let nodesDir = "";
+let rootsDir = "";
 let indexesDir = "";
 let rootPath = "";
 let sourceIndexPath = "";
@@ -176,6 +192,7 @@ let sourceIndexDisplayPath = "";
 function configureContextDir(dir = process.env.ZERO_CONTEXT_DIR) {
   contextDir = dir ? path.resolve(repoRoot, dir) : path.join(repoRoot, ".zero/context");
   nodesDir = path.join(contextDir, "nodes");
+  rootsDir = path.join(contextDir, "roots");
   indexesDir = path.join(contextDir, "indexes");
   rootPath = path.join(contextDir, "root.json");
   sourceIndexPath = path.join(indexesDir, "source-index.json");
@@ -192,7 +209,7 @@ function usage(): never {
   semantic-context capture-fix-plan --source <file> [--fix-plan-json <path>]
   semantic-context project --source <file> --json [--include-superseded]
   semantic-context verify --json [--include-superseded]
-  semantic-context diff --from <context-dir> --to <context-dir> --json`);
+  semantic-context diff --from <context-dir-or-root-snapshot> --to <context-dir-or-root-snapshot> --json`);
   process.exit(1);
 }
 
@@ -231,9 +248,10 @@ function parseArgs(argv: string[]) {
 
 function ensureLayout() {
   mkdirSync(nodesDir, { recursive: true });
+  mkdirSync(rootsDir, { recursive: true });
   mkdirSync(indexesDir, { recursive: true });
   if (!existsSync(sourceIndexPath)) writeJson(sourceIndexPath, { schemaVersion: 1, sources: {} } satisfies SourceIndex);
-  if (!existsSync(rootPath)) writeRoot([], []);
+  if (!existsSync(rootPath)) writeRoot([], [], "init");
 }
 
 function repoRelative(inputPath: string) {
@@ -274,42 +292,37 @@ function withoutHashWithLifecycle(node: SemanticNode): JsonValue {
   return payload as JsonValue;
 }
 
-function rootPayload(nodes: string[], supersededNodes: string[]): JsonValue {
+function rootPayload(nodes: string[], supersededNodes: string[], parentRoot: string | null, reason: RootReason, sourceIndex = sourceIndexDisplayPath): JsonValue {
   return {
     schemaVersion: 1,
+    parentRoot,
+    reason,
     activeNodes: nodes,
     nodes,
     supersededNodes,
-    indexes: {
-      sourceIndex: sourceIndexDisplayPath,
-    },
-  };
-}
-
-export function rootPayloadForSourceIndex(nodes: string[], sourceIndex: string, supersededNodes: string[] = []): JsonValue {
-  const activeNodes = [...new Set(nodes)].sort();
-  const archivedNodes = [...new Set(supersededNodes)].sort();
-  return {
-    schemaVersion: 1,
-    activeNodes,
-    nodes: activeNodes,
-    supersededNodes: archivedNodes,
+    createdAt: null,
     indexes: {
       sourceIndex,
     },
   };
 }
 
+export function rootPayloadForSourceIndex(nodes: string[], sourceIndex: string, supersededNodes: string[] = [], parentRoot: string | null = null, reason: RootReason = "manual"): JsonValue {
+  const activeNodes = [...new Set(nodes)].sort();
+  const archivedNodes = [...new Set(supersededNodes)].sort();
+  return rootPayload(activeNodes, archivedNodes, parentRoot, reason, sourceIndex);
+}
+
 export function nodeHash(node: SemanticNode) {
   return sha256Text(canonicalize(withoutHash(node)));
 }
 
-function rootHash(nodes: string[], supersededNodes: string[]) {
-  return sha256Text(canonicalize(rootPayload(nodes, supersededNodes)));
+function rootHash(nodes: string[], supersededNodes: string[], parentRoot: string | null, reason: RootReason) {
+  return sha256Text(canonicalize(rootPayload(nodes, supersededNodes, parentRoot, reason)));
 }
 
-export function rootHashForSourceIndex(nodes: string[], sourceIndex: string, supersededNodes: string[] = []) {
-  return sha256Text(canonicalize(rootPayloadForSourceIndex(nodes, sourceIndex, supersededNodes)));
+export function rootHashForSourceIndex(nodes: string[], sourceIndex: string, supersededNodes: string[] = [], parentRoot: string | null = null, reason: RootReason = "manual") {
+  return sha256Text(canonicalize(rootPayloadForSourceIndex(nodes, sourceIndex, supersededNodes, parentRoot, reason)));
 }
 
 function writeJson(filePath: string, value: JsonValue) {
@@ -320,36 +333,76 @@ function readJson<T>(filePath: string): T {
   return JSON.parse(readFileSync(filePath, "utf8")) as T;
 }
 
-function activeNodesOf(root: RootFile) {
+function activeNodesOf(root: RootSnapshot) {
   return [...new Set(root.activeNodes ?? root.nodes ?? [])].sort();
 }
 
-function supersededNodesOf(root: RootFile) {
+function supersededNodesOf(root: RootSnapshot) {
   return [...new Set(root.supersededNodes ?? [])].sort();
 }
 
-function allRootNodes(root: RootFile) {
+function allRootNodes(root: RootSnapshot) {
   return [...new Set([...activeNodesOf(root), ...supersededNodesOf(root)])].sort();
 }
 
-function writeRoot(nodes: string[], supersededNodes: string[] = []) {
+function rootSnapshotPath(hash: string) {
+  return path.join(rootsDir, `${hash.replace("sha256:", "")}.json`);
+}
+
+function readRootPointer() {
+  if (!existsSync(rootPath)) return null;
+  const value = readJson<RootPointer | RootSnapshot>(rootPath);
+  if ("currentRoot" in value) return value as RootPointer;
+  return null;
+}
+
+function readRootSnapshotByHash(hash: string) {
+  return readJson<RootSnapshot>(rootSnapshotPath(hash));
+}
+
+function writeRoot(nodes: string[], supersededNodes: string[] = [], reason: RootReason = "manual") {
   const sortedNodes = [...new Set(nodes)].sort();
   const sortedSupersededNodes = [...new Set(supersededNodes)].sort();
-  const root: RootFile = {
+  const previousRoot = readRootPointer()?.currentRoot ?? (existsSync(rootPath) ? readJson<RootSnapshot>(rootPath).contextRoot ?? null : null);
+  const payload = rootPayload(sortedNodes, sortedSupersededNodes, previousRoot, reason);
+  const contextRoot = sha256Text(canonicalize(payload));
+  const snapshot: RootSnapshot = {
+    contextRoot,
+    ...(payload as Omit<RootSnapshot, "contextRoot">),
+  };
+  const snapshotPath = rootSnapshotPath(contextRoot);
+  writeJson(snapshotPath, snapshot as unknown as JsonValue);
+  const pointer: RootPointer = {
     schemaVersion: 1,
-    contextRoot: rootHash(sortedNodes, sortedSupersededNodes),
-    activeNodes: sortedNodes,
-    nodes: sortedNodes,
-    supersededNodes: sortedSupersededNodes,
+    currentRoot: contextRoot,
+    previousRoot,
+    rootPath: displayPath(snapshotPath),
     indexes: {
       sourceIndex: sourceIndexDisplayPath,
     },
   };
-  writeJson(rootPath, root as unknown as JsonValue);
+  writeJson(rootPath, pointer as unknown as JsonValue);
+  return snapshot;
 }
 
 function readRoot() {
-  return readJson<RootFile>(rootPath);
+  const value = readJson<RootPointer | RootSnapshot>(rootPath);
+  if ("currentRoot" in value) return readRootSnapshotByHash(value.currentRoot);
+  return value as RootSnapshot;
+}
+
+function rootPointerFor(root: RootSnapshot) {
+  const pointer = readRootPointer();
+  if (pointer) return pointer;
+  return {
+    schemaVersion: 1,
+    currentRoot: root.contextRoot,
+    previousRoot: root.parentRoot,
+    rootPath: displayPath(rootPath),
+    indexes: {
+      sourceIndex: sourceIndexDisplayPath,
+    },
+  } satisfies RootPointer;
 }
 
 function readSourceIndex() {
@@ -529,7 +582,7 @@ function makeRepairMemoryNodeFromFix(sourcePath: string, fix: { diagnosticCode: 
   return node;
 }
 
-function findActiveNodeById(root: RootFile, nodeId: string) {
+function findActiveNodeById(root: RootSnapshot, nodeId: string) {
   for (const hash of activeNodesOf(root)) {
     const filePath = nodePath(hash);
     if (!existsSync(filePath)) continue;
@@ -539,7 +592,7 @@ function findActiveNodeById(root: RootFile, nodeId: string) {
   return null;
 }
 
-function storeNode(node: SemanticNode): StoreResult {
+function storeNode(node: SemanticNode, reason: RootReason): StoreResult {
   const root = readRoot();
   let activeNodes = activeNodesOf(root);
   let supersededNodes = supersededNodesOf(root);
@@ -550,7 +603,7 @@ function storeNode(node: SemanticNode): StoreResult {
     node.hash = nodeHash(node);
     writeNode(node);
     activeNodes = [...activeNodes, node.hash];
-    writeRoot(activeNodes, supersededNodes);
+    writeRoot(activeNodes, supersededNodes, reason);
     rebuildSourceIndex(activeNodes);
     return { action: "added", node, supersededHash: null };
   }
@@ -559,7 +612,6 @@ function storeNode(node: SemanticNode): StoreResult {
   if (prior.hash === node.hash) {
     const activeNode = { ...prior.node, lifecycle: activeLifecycle() };
     writeNode(activeNode);
-    writeRoot(activeNodes, supersededNodes);
     rebuildSourceIndex(activeNodes);
     return { action: "unchanged", node: activeNode, supersededHash: null };
   }
@@ -582,7 +634,7 @@ function storeNode(node: SemanticNode): StoreResult {
   writeNode(node);
   activeNodes = activeNodes.map((hash) => hash === prior.hash ? node.hash : hash);
   supersededNodes = [...supersededNodes, prior.hash];
-  writeRoot(activeNodes, supersededNodes);
+  writeRoot(activeNodes, supersededNodes, reason);
   rebuildSourceIndex(activeNodes);
   return { action: "superseded", node, supersededHash: prior.hash };
 }
@@ -590,10 +642,14 @@ function storeNode(node: SemanticNode): StoreResult {
 function commandInit() {
   ensureLayout();
   const root = readRoot();
+  const pointer = rootPointerFor(root);
   console.log(JSON.stringify({
     schemaVersion: 1,
     mode: "context-init",
     contextRoot: root.contextRoot,
+    currentRoot: pointer.currentRoot,
+    previousRoot: pointer.previousRoot,
+    rootPath: pointer.rootPath,
     storage: contextDisplayPath,
   }, null, 2));
 }
@@ -603,7 +659,7 @@ function commandCaptureRepair(sourceOption: string | boolean | undefined) {
   ensureLayout();
   const source = repoRelative(sourceOption);
   const node = makeTyp009RepairMemoryNode(source);
-  const stored = storeNode(node);
+  const stored = storeNode(node, "capture-repair");
   console.log(JSON.stringify({
     schemaVersion: 1,
     mode: "context-capture-repair",
@@ -909,7 +965,7 @@ function commandCaptureFixPlan(sourceOption: string | boolean | undefined, fixPl
         });
         continue;
       }
-      const stored = storeNode(makeRepairMemoryNodeFromFix(source, fix, edits));
+      const stored = storeNode(makeRepairMemoryNodeFromFix(source, fix, edits), "capture-fix-plan");
       captured.push({
         nodeId: stored.node.nodeId,
         hash: stored.node.hash,
@@ -1077,7 +1133,7 @@ function commandVerify(includeSupersededOption: string | boolean | undefined) {
   const activeNodes = activeNodesOf(root);
   const supersededNodes = supersededNodesOf(root);
   const checkedHashes = includeSupersededOption === true ? allRootNodes(root) : activeNodes;
-  const expectedRoot = rootHash(activeNodes, supersededNodes);
+  const expectedRoot = rootHash(activeNodes, supersededNodes, root.parentRoot, root.reason);
   if (root.contextRoot !== expectedRoot) {
     pushDiagnostic(diagnostics, {
       code: "CTX-ROOT",
@@ -1118,15 +1174,34 @@ function commandVerify(includeSupersededOption: string | boolean | undefined) {
 }
 
 function resolveContextInput(input: string) {
+  if (input.startsWith("sha256:")) {
+    return {
+      input,
+      contextDir,
+      rootPath: rootSnapshotPath(input),
+      nodesDir,
+    };
+  }
   const resolved = path.resolve(repoRoot, input);
-  const rootFile = path.basename(resolved) === "root.json" ? resolved : path.join(resolved, "root.json");
-  const dir = path.dirname(rootFile);
+  const isJson = path.extname(resolved) === ".json";
+  const isRootSnapshot = isJson && path.basename(path.dirname(resolved)) === "roots";
+  const rootFile = isJson ? resolved : path.join(resolved, "root.json");
+  const dir = isRootSnapshot ? path.dirname(path.dirname(resolved)) : path.dirname(rootFile);
   return {
     input,
     contextDir: dir,
     rootPath: rootFile,
     nodesDir: path.join(dir, "nodes"),
   };
+}
+
+function loadRootFromFile(rootFile: string, contextDirForRoot: string) {
+  const value = readJson<RootPointer | RootSnapshot>(rootFile);
+  if ("currentRoot" in value) {
+    const snapshotPath = path.join(contextDirForRoot, "roots", `${value.currentRoot.replace("sha256:", "")}.json`);
+    return readJson<RootSnapshot>(snapshotPath);
+  }
+  return value as RootSnapshot;
 }
 
 function loadContext(input: string): LoadedContext {
@@ -1151,7 +1226,7 @@ function loadContext(input: string): LoadedContext {
     return loaded;
   }
   try {
-    loaded.root = readJson<RootFile>(resolved.rootPath);
+    loaded.root = loadRootFromFile(resolved.rootPath, resolved.contextDir);
   } catch (error) {
     pushDiagnostic(diagnostics, {
       code: "CTX_DIFF_ROOT_MALFORMED",
@@ -1182,16 +1257,26 @@ function loadContext(input: string): LoadedContext {
     }
     try {
       const node = readJson<SemanticNode>(filePath);
-      loaded.nodesByHash.set(hash, node);
-      if (activeHashes.has(hash) && loaded.nodesById.has(node.nodeId)) {
+      const nodeInSnapshot = activeHashes.has(hash)
+        ? {
+            ...node,
+            lifecycle: {
+              ...lifecycleOf(node),
+              state: "active" as const,
+              supersededBy: null,
+            },
+          }
+        : node;
+      loaded.nodesByHash.set(hash, nodeInSnapshot);
+      if (activeHashes.has(hash) && loaded.nodesById.has(nodeInSnapshot.nodeId)) {
         pushDiagnostic(diagnostics, {
           code: "CTX_DIFF_DUPLICATE_NODE_ID",
-          nodeId: node.nodeId,
+          nodeId: nodeInSnapshot.nodeId,
           message: "context root contains duplicate nodeId entries",
           path: displayPath(filePath),
         });
       }
-      if (activeHashes.has(hash)) loaded.nodesById.set(node.nodeId, node);
+      if (activeHashes.has(hash)) loaded.nodesById.set(nodeInSnapshot.nodeId, nodeInSnapshot);
     } catch (error) {
       pushDiagnostic(diagnostics, {
         code: "CTX_DIFF_NODE_MALFORMED",
