@@ -19,7 +19,7 @@ type SemanticNode = {
   sourceAnchor: {
     path: string;
     range: SourceRange;
-    sourceHash: string;
+    sourceHash: string | null;
     status: "active";
   };
   codes: string[];
@@ -58,11 +58,29 @@ type SourceIndex = {
 
 type Diagnostic = {
   code: string;
+  severity?: "error";
+  nodeId?: string;
   message: string;
   path?: string;
   hash?: string;
   expected?: string;
   actual?: string;
+};
+
+type NodeVerification = {
+  hash: string;
+  nodeId: string;
+  sourceAnchor: {
+    path: string;
+    status: string;
+    currentSourceHash: string | null;
+  };
+  preconditions: Array<{
+    kind: "exact-text";
+    ok: boolean;
+    expected: string;
+    actual: string | null;
+  }>;
 };
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
@@ -127,8 +145,16 @@ function readText(relativePath: string) {
   return readFileSync(path.join(repoRoot, relativePath), "utf8");
 }
 
+function sha256Bytes(bytes: Buffer | string) {
+  return `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
+}
+
 function sha256Text(text: string) {
-  return `sha256:${createHash("sha256").update(text).digest("hex")}`;
+  return sha256Bytes(text);
+}
+
+function sha256File(relativePath: string) {
+  return sha256Bytes(readFileSync(path.join(repoRoot, relativePath)));
 }
 
 function canonicalize(value: JsonValue): string {
@@ -214,6 +240,20 @@ function findMakeBindingMutableAnchor(source: string): SourceRange | null {
     }
   }
   return null;
+}
+
+function extractRangeText(source: string, range: SourceRange): { ok: true; text: string } | { ok: false; actual: string } {
+  if (range.columnUnit !== "utf8-byte") return { ok: false, actual: "unsupported columnUnit" };
+  if (range.start.line !== range.end.line) return { ok: false, actual: "multi-line range" };
+  if (range.start.line < 1 || range.start.column < 1 || range.end.column < range.start.column) return { ok: false, actual: "invalid range coordinates" };
+  const lines = source.split(/\n/);
+  const line = lines[range.start.line - 1];
+  if (line === undefined) return { ok: false, actual: "line out of range" };
+  const startByte = range.start.column - 1;
+  const endByte = range.end.column - 1;
+  const lineBytes = Buffer.from(line, "utf8");
+  if (startByte > lineBytes.length || endByte > lineBytes.length) return { ok: false, actual: "column out of range" };
+  return { ok: true, text: lineBytes.subarray(startByte, endByte).toString("utf8") };
 }
 
 function makeTyp009RepairMemoryNode(sourcePath: string): SemanticNode {
@@ -333,11 +373,26 @@ function commandProject(sourceOption: string | boolean | undefined) {
   }, null, 2));
 }
 
-function verifyNode(node: SemanticNode, filePath: string, diagnostics: Diagnostic[]) {
+function pushDiagnostic(diagnostics: Diagnostic[], diagnostic: Diagnostic) {
+  diagnostics.push({ severity: "error", ...diagnostic });
+}
+
+function verifyNode(node: SemanticNode, filePath: string, diagnostics: Diagnostic[]): NodeVerification {
+  const result: NodeVerification = {
+    hash: node.hash,
+    nodeId: node.nodeId,
+    sourceAnchor: {
+      path: node.sourceAnchor.path,
+      status: node.sourceAnchor.status,
+      currentSourceHash: null,
+    },
+    preconditions: [],
+  };
   const actualHash = nodeHash(node);
   if (node.hash !== actualHash) {
-    diagnostics.push({
+    pushDiagnostic(diagnostics, {
       code: "CTX-HASH",
+      nodeId: node.nodeId,
       message: "context node hash does not match canonical payload",
       path: filePath,
       expected: node.hash,
@@ -346,28 +401,70 @@ function verifyNode(node: SemanticNode, filePath: string, diagnostics: Diagnosti
   }
   const sourcePath = path.join(repoRoot, node.sourceAnchor.path);
   if (!existsSync(sourcePath)) {
-    diagnostics.push({ code: "CTX-SOURCE", message: "source anchor path does not exist", path: node.sourceAnchor.path });
-    return;
+    pushDiagnostic(diagnostics, {
+      code: "CTX_SOURCE_MISSING",
+      nodeId: node.nodeId,
+      message: "source anchor path does not exist",
+      path: node.sourceAnchor.path,
+    });
+    return result;
   }
-  const currentSourceHash = sha256Text(readText(node.sourceAnchor.path));
-  if (node.sourceAnchor.sourceHash !== currentSourceHash) {
-    diagnostics.push({
-      code: "CTX-SOURCE-HASH",
+  const source = readText(node.sourceAnchor.path);
+  const currentSourceHash = sha256File(node.sourceAnchor.path);
+  result.sourceAnchor.currentSourceHash = currentSourceHash;
+  if (node.sourceAnchor.sourceHash !== null && node.sourceAnchor.sourceHash !== currentSourceHash) {
+    pushDiagnostic(diagnostics, {
+      code: "CTX_SOURCE_HASH_MISMATCH",
+      nodeId: node.nodeId,
       message: "source anchor hash does not match current source",
       path: node.sourceAnchor.path,
       expected: node.sourceAnchor.sourceHash,
       actual: currentSourceHash,
     });
   }
+  const extracted = extractRangeText(source, node.sourceAnchor.range);
+  if (!extracted.ok) {
+    pushDiagnostic(diagnostics, {
+      code: "CTX_ANCHOR_RANGE_INVALID",
+      nodeId: node.nodeId,
+      message: "source anchor range is invalid",
+      path: node.sourceAnchor.path,
+      actual: extracted.actual,
+    });
+    return result;
+  }
+  for (const edit of node.projection.frontier.edits) {
+    const precondition = edit.precondition;
+    if (!precondition || precondition.kind !== "exact-text") continue;
+    const preconditionResult = {
+      kind: "exact-text" as const,
+      ok: extracted.text === precondition.text,
+      expected: precondition.text,
+      actual: extracted.text,
+    };
+    result.preconditions.push(preconditionResult);
+    if (!preconditionResult.ok) {
+      pushDiagnostic(diagnostics, {
+        code: "CTX_PRECONDITION_MISMATCH",
+        nodeId: node.nodeId,
+        message: "source anchor text does not satisfy exact-text precondition",
+        path: node.sourceAnchor.path,
+        expected: precondition.text,
+        actual: extracted.text,
+      });
+    }
+  }
+  return result;
 }
 
 function commandVerify() {
   ensureLayout();
   const diagnostics: Diagnostic[] = [];
+  const nodeResults: NodeVerification[] = [];
   const root = readRoot();
   const expectedRoot = rootHash(root.nodes);
   if (root.contextRoot !== expectedRoot) {
-    diagnostics.push({
+    pushDiagnostic(diagnostics, {
       code: "CTX-ROOT",
       message: "context root hash does not match canonical payload",
       path: displayPath(rootPath),
@@ -380,24 +477,25 @@ function commandVerify() {
   for (const hash of root.nodes) {
     const filePath = nodePath(hash);
     if (!existsSync(filePath)) {
-      diagnostics.push({ code: "CTX001", message: "context root references missing node", path: filePath, hash });
+      pushDiagnostic(diagnostics, { code: "CTX001", message: "context root references missing node", path: filePath, hash });
       continue;
     }
     const node = readJson<SemanticNode>(filePath);
-    verifyNode(node, filePath, diagnostics);
+    nodeResults.push(verifyNode(node, filePath, diagnostics));
     if (!indexedHashes.has(hash)) {
-      diagnostics.push({ code: "CTX-INDEX", message: "context node is missing from source index", path: node.sourceAnchor.path, hash });
+      pushDiagnostic(diagnostics, { code: "CTX-INDEX", nodeId: node.nodeId, message: "context node is missing from source index", path: node.sourceAnchor.path, hash });
     }
   }
   for (const filename of existsSync(nodesDir) ? readdirSync(nodesDir).filter((item) => item.endsWith(".json")) : []) {
     const hash = `sha256:${filename.slice(0, -".json".length)}`;
-    if (!root.nodes.includes(hash)) diagnostics.push({ code: "CTX-ORPHAN", message: "node file is not referenced by root", path: displayPath(path.join(nodesDir, filename)), hash });
+    if (!root.nodes.includes(hash)) pushDiagnostic(diagnostics, { code: "CTX-ORPHAN", message: "node file is not referenced by root", path: displayPath(path.join(nodesDir, filename)), hash });
   }
   console.log(JSON.stringify({
     schemaVersion: 1,
     mode: "context-verify",
     ok: diagnostics.length === 0,
     checkedNodes: root.nodes.length,
+    nodes: nodeResults,
     diagnostics,
   }, null, 2));
   if (diagnostics.length > 0) process.exitCode = 1;
