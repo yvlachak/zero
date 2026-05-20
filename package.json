@@ -41,6 +41,7 @@
     "agent:demo": "node --experimental-strip-types --disable-warning=ExperimentalWarning scripts/agent-repair-demo.mts",
     "context:init": "node --experimental-strip-types --disable-warning=ExperimentalWarning scripts/semantic-context.mts init",
     "context:capture-repair": "node --experimental-strip-types --disable-warning=ExperimentalWarning scripts/semantic-context.mts capture-repair --source conformance/native/fail/mem-copy-immutable-dst.0",
+    "context:capture-fix-plan": "node --experimental-strip-types --disable-warning=ExperimentalWarning scripts/semantic-context.mts capture-fix-plan --source conformance/native/fail/mem-copy-immutable-dst.0",
     "context:project": "node --experimental-strip-types --disable-warning=ExperimentalWarning scripts/semantic-context.mts project --source conformance/native/fail/mem-copy-immutable-dst.0 --json",
     "context:verify": "node --experimental-strip-types --disable-warning=ExperimentalWarning scripts/semantic-context.mts verify --json",
     "context:test": "node --experimental-strip-types --disable-warning=ExperimentalWarning scripts/semantic-context-smoke.mts",

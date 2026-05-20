@@ -45,6 +45,13 @@ function tempFixture(name: string) {
   return target;
 }
 
+function tempJson(name: string, value: any) {
+  mkdirSync(fixtureDir, { recursive: true });
+  const target = path.join(fixtureDir, name);
+  writeFileSync(target, typeof value === "string" ? value : `${JSON.stringify(value, null, 2)}\n`);
+  return target;
+}
+
 function captureContext(dir: string) {
   resetStorage(dir);
   run(["init"], { storage: dir });
@@ -136,6 +143,120 @@ try {
   const storedNode = JSON.parse(readFileSync(nodeFile, "utf8"));
   assert.equal(storedNode.hash, capture.node.hash);
   assert.match(storedNode.sourceAnchor.sourceHash, /^sha256:[0-9a-f]{64}$/);
+
+  resetStorage();
+  const fixPlanCapture = run(["capture-fix-plan", "--source", source]);
+  assert.equal(fixPlanCapture.schemaVersion, 1);
+  assert.equal(fixPlanCapture.mode, "context-capture-fix-plan");
+  assert.equal(fixPlanCapture.ok, true);
+  assert.equal(fixPlanCapture.sourceFile, source);
+  assert.equal(fixPlanCapture.captured.length, 1);
+  assert.equal(fixPlanCapture.captured[0].nodeId, "ctx:repair-memory:typ009:make-binding-mutable");
+  assert.equal(fixPlanCapture.captured[0].diagnosticCode, "TYP009");
+  assert.equal(fixPlanCapture.captured[0].repairId, "make-binding-mutable");
+  assert.equal(fixPlanCapture.skipped.length, 0);
+  assert.deepEqual(fixPlanCapture.diagnostics, []);
+
+  const fixPlanProject = run(["project", "--source", source, "--json"]);
+  assert.equal(fixPlanProject.nodes.length, 1);
+  assert.equal(fixPlanProject.nodes[0].hash, fixPlanCapture.captured[0].hash);
+  assert.equal(fixPlanProject.nodes[0].diagnosticCode, "TYP009");
+  assert.equal(fixPlanProject.nodes[0].repairId, "make-binding-mutable");
+  assert.deepEqual(fixPlanProject.nodes[0].frontier.diagnostics, ["TYP009"]);
+  assert.deepEqual(fixPlanProject.nodes[0].frontier.repairs, ["make-binding-mutable"]);
+  assert.equal(fixPlanProject.nodes[0].frontier.edits[0].oldText, "let");
+  assert.equal(fixPlanProject.nodes[0].frontier.edits[0].newText, "let mut");
+  assert.deepEqual(fixPlanProject.diagnostics, []);
+
+  const fixPlanVerify = run(["verify", "--json"]);
+  assert.equal(fixPlanVerify.ok, true);
+  assert.equal(fixPlanVerify.checkedNodes, 1);
+  assert.equal(fixPlanVerify.nodes[0].hash, fixPlanCapture.captured[0].hash);
+  assert.equal(fixPlanVerify.nodes[0].preconditions[0].ok, true);
+  assert.deepEqual(fixPlanVerify.diagnostics, []);
+
+  resetStorage();
+  const previewPlan = tempJson("preview-plan.json", {
+    schemaVersion: 1,
+    mode: "plan",
+    input: source,
+    fixes: [
+      {
+        id: "make-binding-mutable",
+        diagnosticCode: "TYP009",
+        safety: "behavior-preserving",
+        summary: "Synthetic preview repair.",
+        hasPreview: true,
+        edits: [
+          {
+            path: source,
+            range: {
+              start: { line: 2, column: 5 },
+              end: { line: 2, column: 8 },
+              columnUnit: "utf8-byte",
+            },
+            oldText: "let",
+            newText: "let mut",
+            precondition: { kind: "exact-text", text: "let" },
+          },
+        ],
+      },
+    ],
+  });
+  const previewCapture = run(["capture-fix-plan", "--source", source, "--fix-plan-json", previewPlan]);
+  assert.equal(previewCapture.ok, true);
+  assert.equal(previewCapture.captured.length, 1);
+  assert.equal(previewCapture.captured[0].nodeId, "ctx:repair-memory:typ009:make-binding-mutable");
+  const previewVerify = run(["verify", "--json"]);
+  assert.equal(previewVerify.ok, true);
+  assert.equal(previewVerify.nodes[0].preconditions[0].actual, "let");
+
+  resetStorage();
+  const noPreviewPlan = tempJson("no-preview-plan.json", {
+    schemaVersion: 1,
+    mode: "plan",
+    input: source,
+    fixes: [
+      {
+        id: "requires-human-review",
+        diagnosticCode: "TYP999",
+        safety: "requires-human-review",
+        summary: "Synthetic no-preview repair.",
+        hasPreview: false,
+      },
+    ],
+  });
+  const noPreviewCapture = run(["capture-fix-plan", "--source", source, "--fix-plan-json", noPreviewPlan]);
+  assert.equal(noPreviewCapture.ok, true);
+  assert.equal(noPreviewCapture.captured.length, 0);
+  assert.equal(noPreviewCapture.skipped.length, 1);
+  assert.equal(noPreviewCapture.skipped[0].reason, "no-preview");
+  assert(noPreviewCapture.diagnostics.some((diagnostic: any) =>
+    diagnostic.code === "CTX_FIX_PLAN_NO_PREVIEW" &&
+    diagnostic.severity === "warning" &&
+    diagnostic.nodeId === "ctx:repair-memory:typ999:requires-human-review"
+  ));
+
+  resetStorage();
+  const malformedPlan = tempJson("malformed-plan.json", "{");
+  const malformedCapture = run(["capture-fix-plan", "--source", source, "--fix-plan-json", malformedPlan], { allowFailure: true });
+  assert.equal(malformedCapture.ok, false);
+  assert.equal(malformedCapture.captured.length, 0);
+  assert(malformedCapture.diagnostics.some((diagnostic: any) =>
+    diagnostic.code === "CTX_FIX_PLAN_MALFORMED" &&
+    diagnostic.severity === "error"
+  ));
+
+  resetStorage();
+  const fixtureCapture = run(["capture-repair", "--source", source]);
+  const fixtureProject = run(["project", "--source", source, "--json"]);
+  resetStorage();
+  const equivalentFixPlanCapture = run(["capture-fix-plan", "--source", source]);
+  const equivalentFixPlanProject = run(["project", "--source", source, "--json"]);
+  assert.equal(fixtureCapture.node.nodeId, equivalentFixPlanCapture.captured[0].nodeId);
+  assert.equal(fixtureProject.nodes[0].diagnosticCode, equivalentFixPlanProject.nodes[0].diagnosticCode);
+  assert.equal(fixtureProject.nodes[0].repairId, equivalentFixPlanProject.nodes[0].repairId);
+  assert.deepEqual(fixtureProject.nodes[0].frontier, equivalentFixPlanProject.nodes[0].frontier);
 
   resetStorage();
   const mismatchSource = tempFixture("precondition-mismatch.0");
