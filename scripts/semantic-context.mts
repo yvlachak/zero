@@ -1,0 +1,403 @@
+#!/usr/bin/env -S node --experimental-strip-types --disable-warning=ExperimentalWarning
+import { createHash } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
+
+type SourceRange = {
+  start: { line: number; column: number };
+  end: { line: number; column: number };
+  columnUnit: "utf8-byte";
+};
+
+type SemanticNode = {
+  schemaVersion: 1;
+  kind: "repair-memory";
+  nodeId: string;
+  sourceAnchor: {
+    path: string;
+    range: SourceRange;
+    sourceHash: string;
+    status: "active";
+  };
+  codes: string[];
+  diagnosticCode: string;
+  repairId: string;
+  residualSummary: string;
+  projection: {
+    kind: "context-projection";
+    frontier: {
+      diagnostics: string[];
+      repairs: string[];
+      edits: Array<{
+        oldText: string;
+        newText: string;
+        precondition: { kind: "exact-text"; text: string };
+      }>;
+    };
+  };
+  parents: string[];
+  hash: string;
+};
+
+type RootFile = {
+  schemaVersion: 1;
+  contextRoot: string;
+  nodes: string[];
+  indexes: {
+    sourceIndex: string;
+  };
+};
+
+type SourceIndex = {
+  schemaVersion: 1;
+  sources: Record<string, string[]>;
+};
+
+type Diagnostic = {
+  code: string;
+  message: string;
+  path?: string;
+  hash?: string;
+  expected?: string;
+  actual?: string;
+};
+
+const scriptDir = path.dirname(fileURLToPath(import.meta.url));
+const repoRoot = path.resolve(scriptDir, "..");
+const contextDir = path.join(repoRoot, ".zero/context");
+const nodesDir = path.join(contextDir, "nodes");
+const indexesDir = path.join(contextDir, "indexes");
+const rootPath = path.join(contextDir, "root.json");
+const sourceIndexPath = path.join(indexesDir, "source-index.json");
+const sourceIndexDisplayPath = ".zero/context/indexes/source-index.json";
+
+function usage(): never {
+  console.error(`Usage:
+  semantic-context init
+  semantic-context capture-repair --source <file>
+  semantic-context project --source <file> --json
+  semantic-context verify --json`);
+  process.exit(1);
+}
+
+function parseArgs(argv: string[]) {
+  const [command, ...rest] = argv;
+  const options: Record<string, string | boolean> = {};
+  for (let i = 0; i < rest.length; i++) {
+    const arg = rest[i];
+    if (arg === "--json") {
+      options.json = true;
+    } else if (arg === "--source") {
+      const value = rest[++i];
+      if (!value) usage();
+      options.source = value;
+    } else {
+      usage();
+    }
+  }
+  if (!command) usage();
+  return { command, options };
+}
+
+function ensureLayout() {
+  mkdirSync(nodesDir, { recursive: true });
+  mkdirSync(indexesDir, { recursive: true });
+  if (!existsSync(sourceIndexPath)) writeJson(sourceIndexPath, { schemaVersion: 1, sources: {} } satisfies SourceIndex);
+  if (!existsSync(rootPath)) writeRoot([]);
+}
+
+function repoRelative(inputPath: string) {
+  const resolved = path.resolve(repoRoot, inputPath);
+  return path.relative(repoRoot, resolved).split(path.sep).join("/");
+}
+
+function readText(relativePath: string) {
+  return readFileSync(path.join(repoRoot, relativePath), "utf8");
+}
+
+function sha256Text(text: string) {
+  return `sha256:${createHash("sha256").update(text).digest("hex")}`;
+}
+
+function canonicalize(value: JsonValue): string {
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map((item) => canonicalize(item)).join(",")}]`;
+  const keys = Object.keys(value).sort();
+  return `{${keys.map((key) => `${JSON.stringify(key)}:${canonicalize(value[key])}`).join(",")}}`;
+}
+
+function withoutHash(node: SemanticNode): JsonValue {
+  const { hash: _hash, ...payload } = node;
+  return payload as JsonValue;
+}
+
+function rootPayload(nodes: string[]): JsonValue {
+  return {
+    schemaVersion: 1,
+    nodes,
+    indexes: {
+      sourceIndex: sourceIndexDisplayPath,
+    },
+  };
+}
+
+function nodeHash(node: SemanticNode) {
+  return sha256Text(canonicalize(withoutHash(node)));
+}
+
+function rootHash(nodes: string[]) {
+  return sha256Text(canonicalize(rootPayload(nodes)));
+}
+
+function writeJson(filePath: string, value: JsonValue) {
+  writeFileSync(filePath, `${JSON.stringify(value, null, 2)}\n`);
+}
+
+function readJson<T>(filePath: string): T {
+  return JSON.parse(readFileSync(filePath, "utf8")) as T;
+}
+
+function writeRoot(nodes: string[]) {
+  const sortedNodes = [...new Set(nodes)].sort();
+  const root: RootFile = {
+    schemaVersion: 1,
+    contextRoot: rootHash(sortedNodes),
+    nodes: sortedNodes,
+    indexes: {
+      sourceIndex: sourceIndexDisplayPath,
+    },
+  };
+  writeJson(rootPath, root as unknown as JsonValue);
+}
+
+function readRoot() {
+  return readJson<RootFile>(rootPath);
+}
+
+function readSourceIndex() {
+  return readJson<SourceIndex>(sourceIndexPath);
+}
+
+function writeSourceIndex(index: SourceIndex) {
+  const sources: Record<string, string[]> = {};
+  for (const source of Object.keys(index.sources).sort()) sources[source] = [...new Set(index.sources[source])].sort();
+  writeJson(sourceIndexPath, { schemaVersion: 1, sources } satisfies SourceIndex as unknown as JsonValue);
+}
+
+function nodePath(hash: string) {
+  return path.join(nodesDir, `${hash.replace("sha256:", "")}.json`);
+}
+
+function findMakeBindingMutableAnchor(source: string): SourceRange | null {
+  const lines = source.split(/\n/);
+  for (let index = 0; index < lines.length; index++) {
+    const line = lines[index];
+    const letIndex = line.indexOf("let ");
+    if (letIndex >= 0 && !line.includes("let mut ") && line.includes("[")) {
+      return {
+        start: { line: index + 1, column: letIndex + 1 },
+        end: { line: index + 1, column: letIndex + 4 },
+        columnUnit: "utf8-byte",
+      };
+    }
+  }
+  return null;
+}
+
+function makeTyp009RepairMemoryNode(sourcePath: string): SemanticNode {
+  const source = readText(sourcePath);
+  const range = findMakeBindingMutableAnchor(source);
+  if (!range) {
+    throw new Error(`no make-binding-mutable anchor found in ${sourcePath}`);
+  }
+  const node: SemanticNode = {
+    schemaVersion: 1,
+    kind: "repair-memory",
+    nodeId: "ctx:repair-memory:typ009:make-binding-mutable",
+    sourceAnchor: {
+      path: sourcePath,
+      range,
+      sourceHash: sha256Text(source),
+      status: "active",
+    },
+    codes: ["DIAGNOSTIC_REPAIR", "MUTABLE_BINDING_REQUIRED", "BEHAVIOR_PRESERVING_EDIT"],
+    diagnosticCode: "TYP009",
+    repairId: "make-binding-mutable",
+    residualSummary: "An immutable array binding cannot be passed to a mutable span API; make the root binding mutable.",
+    projection: {
+      kind: "context-projection",
+      frontier: {
+        diagnostics: ["TYP009"],
+        repairs: ["make-binding-mutable"],
+        edits: [
+          {
+            oldText: "let",
+            newText: "let mut",
+            precondition: { kind: "exact-text", text: "let" },
+          },
+        ],
+      },
+    },
+    parents: [],
+    hash: "",
+  };
+  node.hash = nodeHash(node);
+  return node;
+}
+
+function storeNode(node: SemanticNode) {
+  writeJson(nodePath(node.hash), node as unknown as JsonValue);
+  const root = readRoot();
+  writeRoot([...root.nodes, node.hash]);
+  const index = readSourceIndex();
+  index.sources[node.sourceAnchor.path] = [...(index.sources[node.sourceAnchor.path] ?? []), node.hash];
+  writeSourceIndex(index);
+}
+
+function commandInit() {
+  ensureLayout();
+  const root = readRoot();
+  console.log(JSON.stringify({
+    schemaVersion: 1,
+    mode: "context-init",
+    contextRoot: root.contextRoot,
+    storage: ".zero/context",
+  }, null, 2));
+}
+
+function commandCaptureRepair(sourceOption: string | boolean | undefined) {
+  if (typeof sourceOption !== "string") usage();
+  ensureLayout();
+  const source = repoRelative(sourceOption);
+  const node = makeTyp009RepairMemoryNode(source);
+  storeNode(node);
+  console.log(JSON.stringify({
+    schemaVersion: 1,
+    mode: "context-capture-repair",
+    node: {
+      kind: node.kind,
+      nodeId: node.nodeId,
+      hash: node.hash,
+      sourceFile: node.sourceAnchor.path,
+    },
+  }, null, 2));
+}
+
+function projectNode(node: SemanticNode) {
+  return {
+    kind: node.kind,
+    nodeId: node.nodeId,
+    hash: node.hash,
+    codes: node.codes,
+    diagnosticCode: node.diagnosticCode,
+    repairId: node.repairId,
+    residualSummary: node.residualSummary,
+    frontier: node.projection.frontier,
+  };
+}
+
+function commandProject(sourceOption: string | boolean | undefined) {
+  if (typeof sourceOption !== "string") usage();
+  ensureLayout();
+  const source = repoRelative(sourceOption);
+  const diagnostics: Diagnostic[] = [];
+  const index = readSourceIndex();
+  const hashes = index.sources[source] ?? [];
+  const nodes = [];
+  for (const hash of hashes) {
+    const filePath = nodePath(hash);
+    if (!existsSync(filePath)) {
+      diagnostics.push({ code: "CTX001", message: "indexed context node is missing", path: source, hash });
+      continue;
+    }
+    nodes.push(projectNode(readJson<SemanticNode>(filePath)));
+  }
+  console.log(JSON.stringify({
+    schemaVersion: 1,
+    mode: "context-project",
+    sourceFile: source,
+    nodes,
+    diagnostics,
+  }, null, 2));
+}
+
+function verifyNode(node: SemanticNode, filePath: string, diagnostics: Diagnostic[]) {
+  const actualHash = nodeHash(node);
+  if (node.hash !== actualHash) {
+    diagnostics.push({
+      code: "CTX-HASH",
+      message: "context node hash does not match canonical payload",
+      path: filePath,
+      expected: node.hash,
+      actual: actualHash,
+    });
+  }
+  const sourcePath = path.join(repoRoot, node.sourceAnchor.path);
+  if (!existsSync(sourcePath)) {
+    diagnostics.push({ code: "CTX-SOURCE", message: "source anchor path does not exist", path: node.sourceAnchor.path });
+    return;
+  }
+  const currentSourceHash = sha256Text(readText(node.sourceAnchor.path));
+  if (node.sourceAnchor.sourceHash !== currentSourceHash) {
+    diagnostics.push({
+      code: "CTX-SOURCE-HASH",
+      message: "source anchor hash does not match current source",
+      path: node.sourceAnchor.path,
+      expected: node.sourceAnchor.sourceHash,
+      actual: currentSourceHash,
+    });
+  }
+}
+
+function commandVerify() {
+  ensureLayout();
+  const diagnostics: Diagnostic[] = [];
+  const root = readRoot();
+  const expectedRoot = rootHash(root.nodes);
+  if (root.contextRoot !== expectedRoot) {
+    diagnostics.push({
+      code: "CTX-ROOT",
+      message: "context root hash does not match canonical payload",
+      path: ".zero/context/root.json",
+      expected: root.contextRoot,
+      actual: expectedRoot,
+    });
+  }
+  const index = readSourceIndex();
+  const indexedHashes = new Set(Object.values(index.sources).flat());
+  for (const hash of root.nodes) {
+    const filePath = nodePath(hash);
+    if (!existsSync(filePath)) {
+      diagnostics.push({ code: "CTX001", message: "context root references missing node", path: filePath, hash });
+      continue;
+    }
+    const node = readJson<SemanticNode>(filePath);
+    verifyNode(node, filePath, diagnostics);
+    if (!indexedHashes.has(hash)) {
+      diagnostics.push({ code: "CTX-INDEX", message: "context node is missing from source index", path: node.sourceAnchor.path, hash });
+    }
+  }
+  for (const filename of existsSync(nodesDir) ? readdirSync(nodesDir).filter((item) => item.endsWith(".json")) : []) {
+    const hash = `sha256:${filename.slice(0, -".json".length)}`;
+    if (!root.nodes.includes(hash)) diagnostics.push({ code: "CTX-ORPHAN", message: "node file is not referenced by root", path: path.join(".zero/context/nodes", filename), hash });
+  }
+  console.log(JSON.stringify({
+    schemaVersion: 1,
+    mode: "context-verify",
+    ok: diagnostics.length === 0,
+    checkedNodes: root.nodes.length,
+    diagnostics,
+  }, null, 2));
+  if (diagnostics.length > 0) process.exitCode = 1;
+}
+
+const { command, options } = parseArgs(process.argv.slice(2));
+
+if (command === "init") commandInit();
+else if (command === "capture-repair") commandCaptureRepair(options.source);
+else if (command === "project") commandProject(options.source);
+else if (command === "verify") commandVerify();
+else usage();
