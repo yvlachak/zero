@@ -83,30 +83,63 @@ type NodeVerification = {
   }>;
 };
 
+type NodeSummary = {
+  hash: string;
+  nodeId: string;
+  kind: string;
+};
+
+type NodeChange = {
+  path: string;
+  from: JsonValue;
+  to: JsonValue;
+};
+
+type LoadedContext = {
+  input: string;
+  contextDir: string;
+  rootPath: string;
+  nodesDir: string;
+  root: RootFile | null;
+  nodesById: Map<string, SemanticNode>;
+  diagnostics: Diagnostic[];
+};
+
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(scriptDir, "..");
-const configuredContextDir = process.env.ZERO_CONTEXT_DIR;
-const contextDir = configuredContextDir ? path.resolve(repoRoot, configuredContextDir) : path.join(repoRoot, ".zero/context");
-const nodesDir = path.join(contextDir, "nodes");
-const indexesDir = path.join(contextDir, "indexes");
-const rootPath = path.join(contextDir, "root.json");
-const sourceIndexPath = path.join(indexesDir, "source-index.json");
-
 function displayPath(filePath: string) {
   const relative = path.relative(repoRoot, filePath);
   if (!relative.startsWith("..") && !path.isAbsolute(relative)) return relative.split(path.sep).join("/");
   return filePath.split(path.sep).join("/");
 }
 
-const contextDisplayPath = displayPath(contextDir);
-const sourceIndexDisplayPath = displayPath(sourceIndexPath);
+let contextDir = "";
+let nodesDir = "";
+let indexesDir = "";
+let rootPath = "";
+let sourceIndexPath = "";
+let contextDisplayPath = "";
+let sourceIndexDisplayPath = "";
+
+function configureContextDir(dir = process.env.ZERO_CONTEXT_DIR) {
+  contextDir = dir ? path.resolve(repoRoot, dir) : path.join(repoRoot, ".zero/context");
+  nodesDir = path.join(contextDir, "nodes");
+  indexesDir = path.join(contextDir, "indexes");
+  rootPath = path.join(contextDir, "root.json");
+  sourceIndexPath = path.join(indexesDir, "source-index.json");
+  contextDisplayPath = displayPath(contextDir);
+  sourceIndexDisplayPath = displayPath(sourceIndexPath);
+}
+
+configureContextDir();
 
 function usage(): never {
   console.error(`Usage:
   semantic-context init
   semantic-context capture-repair --source <file>
   semantic-context project --source <file> --json
-  semantic-context verify --json`);
+  semantic-context verify --json
+  semantic-context diff --from <context-dir> --to <context-dir> --json`);
   process.exit(1);
 }
 
@@ -121,6 +154,14 @@ function parseArgs(argv: string[]) {
       const value = rest[++i];
       if (!value) usage();
       options.source = value;
+    } else if (arg === "--from") {
+      const value = rest[++i];
+      if (!value) usage();
+      options.from = value;
+    } else if (arg === "--to") {
+      const value = rest[++i];
+      if (!value) usage();
+      options.to = value;
     } else {
       usage();
     }
@@ -157,7 +198,7 @@ function sha256File(relativePath: string) {
   return sha256Bytes(readFileSync(path.join(repoRoot, relativePath)));
 }
 
-function canonicalize(value: JsonValue): string {
+export function canonicalize(value: JsonValue): string {
   if (value === null || typeof value !== "object") return JSON.stringify(value);
   if (Array.isArray(value)) return `[${value.map((item) => canonicalize(item)).join(",")}]`;
   const keys = Object.keys(value).sort();
@@ -179,12 +220,26 @@ function rootPayload(nodes: string[]): JsonValue {
   };
 }
 
-function nodeHash(node: SemanticNode) {
+export function rootPayloadForSourceIndex(nodes: string[], sourceIndex: string): JsonValue {
+  return {
+    schemaVersion: 1,
+    nodes,
+    indexes: {
+      sourceIndex,
+    },
+  };
+}
+
+export function nodeHash(node: SemanticNode) {
   return sha256Text(canonicalize(withoutHash(node)));
 }
 
 function rootHash(nodes: string[]) {
   return sha256Text(canonicalize(rootPayload(nodes)));
+}
+
+export function rootHashForSourceIndex(nodes: string[], sourceIndex: string) {
+  return sha256Text(canonicalize(rootPayloadForSourceIndex(nodes, sourceIndex)));
 }
 
 function writeJson(filePath: string, value: JsonValue) {
@@ -501,12 +556,195 @@ function commandVerify() {
   if (diagnostics.length > 0) process.exitCode = 1;
 }
 
+function resolveContextInput(input: string) {
+  const resolved = path.resolve(repoRoot, input);
+  const rootFile = path.basename(resolved) === "root.json" ? resolved : path.join(resolved, "root.json");
+  const dir = path.dirname(rootFile);
+  return {
+    input,
+    contextDir: dir,
+    rootPath: rootFile,
+    nodesDir: path.join(dir, "nodes"),
+  };
+}
+
+function loadContext(input: string): LoadedContext {
+  const resolved = resolveContextInput(input);
+  const diagnostics: Diagnostic[] = [];
+  const loaded: LoadedContext = {
+    input,
+    contextDir: resolved.contextDir,
+    rootPath: resolved.rootPath,
+    nodesDir: resolved.nodesDir,
+    root: null,
+    nodesById: new Map(),
+    diagnostics,
+  };
+  if (!existsSync(resolved.rootPath)) {
+    pushDiagnostic(diagnostics, {
+      code: "CTX_DIFF_ROOT_MISSING",
+      message: "context root file does not exist",
+      path: displayPath(resolved.rootPath),
+    });
+    return loaded;
+  }
+  try {
+    loaded.root = readJson<RootFile>(resolved.rootPath);
+  } catch (error) {
+    pushDiagnostic(diagnostics, {
+      code: "CTX_DIFF_ROOT_MALFORMED",
+      message: error instanceof Error ? error.message : "context root is not valid JSON",
+      path: displayPath(resolved.rootPath),
+    });
+    return loaded;
+  }
+  if (loaded.root.schemaVersion !== 1 || !Array.isArray(loaded.root.nodes)) {
+    pushDiagnostic(diagnostics, {
+      code: "CTX_DIFF_ROOT_MALFORMED",
+      message: "context root has an unsupported schema",
+      path: displayPath(resolved.rootPath),
+    });
+    return loaded;
+  }
+  for (const hash of loaded.root.nodes) {
+    const filePath = path.join(resolved.nodesDir, `${hash.replace("sha256:", "")}.json`);
+    if (!existsSync(filePath)) {
+      pushDiagnostic(diagnostics, {
+        code: "CTX_DIFF_NODE_MISSING",
+        message: "context root references missing node",
+        path: displayPath(filePath),
+        hash,
+      });
+      continue;
+    }
+    try {
+      const node = readJson<SemanticNode>(filePath);
+      if (loaded.nodesById.has(node.nodeId)) {
+        pushDiagnostic(diagnostics, {
+          code: "CTX_DIFF_DUPLICATE_NODE_ID",
+          nodeId: node.nodeId,
+          message: "context root contains duplicate nodeId entries",
+          path: displayPath(filePath),
+        });
+      }
+      loaded.nodesById.set(node.nodeId, node);
+    } catch (error) {
+      pushDiagnostic(diagnostics, {
+        code: "CTX_DIFF_NODE_MALFORMED",
+        message: error instanceof Error ? error.message : "context node is not valid JSON",
+        path: displayPath(filePath),
+        hash,
+      });
+    }
+  }
+  return loaded;
+}
+
+function summarizeNode(node: SemanticNode): NodeSummary {
+  return {
+    hash: node.hash,
+    nodeId: node.nodeId,
+    kind: node.kind,
+  };
+}
+
+function diffValues(pathName: string, fromValue: JsonValue, toValue: JsonValue, changes: NodeChange[]) {
+  if (canonicalize(fromValue) === canonicalize(toValue)) return;
+  if (
+    fromValue &&
+    toValue &&
+    typeof fromValue === "object" &&
+    typeof toValue === "object" &&
+    !Array.isArray(fromValue) &&
+    !Array.isArray(toValue)
+  ) {
+    const keys = new Set([...Object.keys(fromValue), ...Object.keys(toValue)]);
+    for (const key of [...keys].sort()) {
+      const fromObject = fromValue as { [key: string]: JsonValue };
+      const toObject = toValue as { [key: string]: JsonValue };
+      diffValues(pathName ? `${pathName}.${key}` : key, fromObject[key] ?? null, toObject[key] ?? null, changes);
+    }
+    return;
+  }
+  changes.push({
+    path: pathName,
+    from: fromValue,
+    to: toValue,
+  });
+}
+
+function diffNodes(fromNode: SemanticNode, toNode: SemanticNode) {
+  const changes: NodeChange[] = [];
+  diffValues("", withoutHash(fromNode), withoutHash(toNode), changes);
+  return {
+    nodeId: toNode.nodeId,
+    fromHash: fromNode.hash,
+    toHash: toNode.hash,
+    kind: toNode.kind,
+    changes,
+  };
+}
+
+function commandDiff(fromOption: string | boolean | undefined, toOption: string | boolean | undefined) {
+  if (typeof fromOption !== "string" || typeof toOption !== "string") usage();
+  const fromContext = loadContext(fromOption);
+  const toContext = loadContext(toOption);
+  const diagnostics = [...fromContext.diagnostics, ...toContext.diagnostics];
+  const added: NodeSummary[] = [];
+  const removed: NodeSummary[] = [];
+  const changed = [];
+  const unchanged: NodeSummary[] = [];
+  if (fromContext.root && toContext.root) {
+    const nodeIds = new Set([...fromContext.nodesById.keys(), ...toContext.nodesById.keys()]);
+    for (const nodeId of [...nodeIds].sort()) {
+      const fromNode = fromContext.nodesById.get(nodeId);
+      const toNode = toContext.nodesById.get(nodeId);
+      if (!fromNode && toNode) {
+        added.push(summarizeNode(toNode));
+      } else if (fromNode && !toNode) {
+        removed.push(summarizeNode(fromNode));
+      } else if (fromNode && toNode && fromNode.hash === toNode.hash) {
+        unchanged.push(summarizeNode(toNode));
+      } else if (fromNode && toNode) {
+        changed.push(diffNodes(fromNode, toNode));
+      }
+    }
+  }
+  console.log(JSON.stringify({
+    schemaVersion: 1,
+    mode: "context-diff",
+    ok: diagnostics.length === 0,
+    from: {
+      contextRoot: fromContext.root?.contextRoot ?? null,
+    },
+    to: {
+      contextRoot: toContext.root?.contextRoot ?? null,
+    },
+    summary: {
+      added: added.length,
+      removed: removed.length,
+      changed: changed.length,
+      unchanged: unchanged.length,
+    },
+    nodes: {
+      added,
+      removed,
+      changed,
+      unchanged,
+    },
+    diagnostics,
+  }, null, 2));
+  if (diagnostics.length > 0) process.exitCode = 1;
+}
+
 export function main(argv = process.argv.slice(2)) {
+  configureContextDir();
   const { command, options } = parseArgs(argv);
   if (command === "init") commandInit();
   else if (command === "capture-repair") commandCaptureRepair(options.source);
   else if (command === "project") commandProject(options.source);
   else if (command === "verify") commandVerify();
+  else if (command === "diff") commandDiff(options.from, options.to);
   else usage();
 }
 

@@ -11,13 +11,15 @@ const fixtureDir = path.join("/tmp", `zero-semantic-context-fixtures-${process.p
 const source = "conformance/native/fail/mem-copy-immutable-dst.0";
 
 process.env.ZERO_CONTEXT_DIR = storage;
-const { main } = await import("./semantic-context.mts");
+const { main, nodeHash, rootHashForSourceIndex } = await import("./semantic-context.mts");
 
-function run(args: string[], options: { allowFailure?: boolean } = {}): any {
+function run(args: string[], options: { allowFailure?: boolean; storage?: string } = {}): any {
   const originalLog = console.log;
   const priorExitCode = process.exitCode;
+  const priorContextDir = process.env.ZERO_CONTEXT_DIR;
   let stdout = "";
   process.exitCode = undefined;
+  process.env.ZERO_CONTEXT_DIR = options.storage ?? storage;
   console.log = (value?: unknown) => {
     stdout += `${String(value ?? "")}\n`;
   };
@@ -28,11 +30,12 @@ function run(args: string[], options: { allowFailure?: boolean } = {}): any {
   }
   if (!options.allowFailure) assert.equal(process.exitCode ?? 0, 0);
   process.exitCode = priorExitCode;
+  process.env.ZERO_CONTEXT_DIR = priorContextDir;
   return JSON.parse(stdout);
 }
 
-function resetStorage() {
-  rmSync(storage, { recursive: true, force: true });
+function resetStorage(dir = storage) {
+  rmSync(dir, { recursive: true, force: true });
 }
 
 function tempFixture(name: string) {
@@ -40,6 +43,33 @@ function tempFixture(name: string) {
   const target = path.join(fixtureDir, name);
   writeFileSync(target, readFileSync(path.join(repoRoot, source), "utf8"));
   return target;
+}
+
+function captureContext(dir: string) {
+  resetStorage(dir);
+  run(["init"], { storage: dir });
+  return run(["capture-repair", "--source", source], { storage: dir });
+}
+
+function mutateResidualSummary(dir: string, summary: string) {
+  const rootPath = path.join(dir, "root.json");
+  const indexPath = path.join(dir, "indexes/source-index.json");
+  const root = JSON.parse(readFileSync(rootPath, "utf8"));
+  const oldHash = root.nodes[0];
+  const oldNodePath = path.join(dir, "nodes", `${oldHash.replace("sha256:", "")}.json`);
+  const node = JSON.parse(readFileSync(oldNodePath, "utf8"));
+  node.residualSummary = summary;
+  node.hash = nodeHash(node);
+  const newNodePath = path.join(dir, "nodes", `${node.hash.replace("sha256:", "")}.json`);
+  writeFileSync(newNodePath, `${JSON.stringify(node, null, 2)}\n`);
+  rmSync(oldNodePath, { force: true });
+  root.nodes = [node.hash];
+  root.contextRoot = rootHashForSourceIndex(root.nodes, indexPath.split(path.sep).join("/"));
+  writeFileSync(rootPath, `${JSON.stringify(root, null, 2)}\n`);
+  const index = JSON.parse(readFileSync(indexPath, "utf8"));
+  index.sources[node.sourceAnchor.path] = [node.hash];
+  writeFileSync(indexPath, `${JSON.stringify(index, null, 2)}\n`);
+  return node;
 }
 
 try {
@@ -143,6 +173,52 @@ try {
     diagnostic.severity === "error" &&
     diagnostic.nodeId === "ctx:repair-memory:typ009:make-binding-mutable"
   ));
+
+  const sameA = path.join("/tmp", `zero-semantic-context-same-a-${process.pid}`);
+  const sameB = path.join("/tmp", `zero-semantic-context-same-b-${process.pid}`);
+  const addedA = path.join("/tmp", `zero-semantic-context-added-a-${process.pid}`);
+  const addedB = path.join("/tmp", `zero-semantic-context-added-b-${process.pid}`);
+  const changedA = path.join("/tmp", `zero-semantic-context-changed-a-${process.pid}`);
+  const changedB = path.join("/tmp", `zero-semantic-context-changed-b-${process.pid}`);
+  try {
+    const sameCaptureA = captureContext(sameA);
+    const sameCaptureB = captureContext(sameB);
+    assert.equal(sameCaptureA.node.hash, sameCaptureB.node.hash);
+    const identicalDiff = run(["diff", "--from", sameA, "--to", sameB, "--json"]);
+    assert.equal(identicalDiff.schemaVersion, 1);
+    assert.equal(identicalDiff.mode, "context-diff");
+    assert.equal(identicalDiff.ok, true);
+    assert.deepEqual(identicalDiff.summary, { added: 0, removed: 0, changed: 0, unchanged: 1 });
+    assert.equal(identicalDiff.nodes.unchanged[0].nodeId, "ctx:repair-memory:typ009:make-binding-mutable");
+
+    resetStorage(addedA);
+    run(["init"], { storage: addedA });
+    const addedCapture = captureContext(addedB);
+    const addedDiff = run(["diff", "--from", addedA, "--to", addedB, "--json"]);
+    assert.equal(addedDiff.ok, true);
+    assert.deepEqual(addedDiff.summary, { added: 1, removed: 0, changed: 0, unchanged: 0 });
+    assert.equal(addedDiff.nodes.added[0].hash, addedCapture.node.hash);
+
+    const removedDiff = run(["diff", "--from", addedB, "--to", addedA, "--json"]);
+    assert.equal(removedDiff.ok, true);
+    assert.deepEqual(removedDiff.summary, { added: 0, removed: 1, changed: 0, unchanged: 0 });
+    assert.equal(removedDiff.nodes.removed[0].hash, addedCapture.node.hash);
+
+    captureContext(changedA);
+    captureContext(changedB);
+    const changedNode = mutateResidualSummary(changedB, "Changed residual summary for semantic diff testing.");
+    const changedDiff = run(["diff", "--from", changedA, "--to", changedB, "--json"]);
+    assert.equal(changedDiff.ok, true);
+    assert.deepEqual(changedDiff.summary, { added: 0, removed: 0, changed: 1, unchanged: 0 });
+    assert.equal(changedDiff.nodes.changed[0].nodeId, "ctx:repair-memory:typ009:make-binding-mutable");
+    assert.equal(changedDiff.nodes.changed[0].toHash, changedNode.hash);
+    assert(changedDiff.nodes.changed[0].changes.some((change: any) =>
+      change.path === "residualSummary" &&
+      change.to === "Changed residual summary for semantic diff testing."
+    ));
+  } finally {
+    for (const dir of [sameA, sameB, addedA, addedB, changedA, changedB]) resetStorage(dir);
+  }
 
   console.log("semantic context smoke ok");
 } finally {
