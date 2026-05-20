@@ -40,6 +40,11 @@ type SemanticNode = {
     };
   };
   parents: string[];
+  lifecycle: {
+    state: "active" | "superseded";
+    supersedes: string[];
+    supersededBy: string | null;
+  };
   hash: string;
 };
 
@@ -47,6 +52,8 @@ type RootFile = {
   schemaVersion: 1;
   contextRoot: string;
   nodes: string[];
+  activeNodes?: string[];
+  supersededNodes?: string[];
   indexes: {
     sourceIndex: string;
   };
@@ -71,6 +78,11 @@ type Diagnostic = {
 type NodeVerification = {
   hash: string;
   nodeId: string;
+  lifecycle: {
+    state: "active" | "superseded";
+    supersedes: string[];
+    supersededBy: string | null;
+  };
   sourceAnchor: {
     path: string;
     status: string;
@@ -88,6 +100,11 @@ type NodeSummary = {
   hash: string;
   nodeId: string;
   kind: string;
+  lifecycle: {
+    state: "active" | "superseded";
+    supersedes: string[];
+    supersededBy: string | null;
+  };
 };
 
 type NodeChange = {
@@ -103,6 +120,7 @@ type LoadedContext = {
   nodesDir: string;
   root: RootFile | null;
   nodesById: Map<string, SemanticNode>;
+  nodesByHash: Map<string, SemanticNode>;
   diagnostics: Diagnostic[];
 };
 
@@ -117,12 +135,19 @@ type FixPlanEdit = {
 type CapturedFixPlanNode = {
   nodeId: string;
   hash: string;
+  action: "added" | "unchanged" | "superseded";
   diagnosticCode: string;
   repairId: string;
   sourceAnchor: {
     path: string;
     range: SourceRange;
   };
+};
+
+type StoreResult = {
+  action: "added" | "unchanged" | "superseded";
+  node: SemanticNode;
+  supersededHash: string | null;
 };
 
 type SkippedFixPlanNode = {
@@ -165,8 +190,8 @@ function usage(): never {
   semantic-context init
   semantic-context capture-repair --source <file>
   semantic-context capture-fix-plan --source <file> [--fix-plan-json <path>]
-  semantic-context project --source <file> --json
-  semantic-context verify --json
+  semantic-context project --source <file> --json [--include-superseded]
+  semantic-context verify --json [--include-superseded]
   semantic-context diff --from <context-dir> --to <context-dir> --json`);
   process.exit(1);
 }
@@ -178,6 +203,8 @@ function parseArgs(argv: string[]) {
     const arg = rest[i];
     if (arg === "--json") {
       options.json = true;
+    } else if (arg === "--include-superseded") {
+      options.includeSuperseded = true;
     } else if (arg === "--source") {
       const value = rest[++i];
       if (!value) usage();
@@ -206,7 +233,7 @@ function ensureLayout() {
   mkdirSync(nodesDir, { recursive: true });
   mkdirSync(indexesDir, { recursive: true });
   if (!existsSync(sourceIndexPath)) writeJson(sourceIndexPath, { schemaVersion: 1, sources: {} } satisfies SourceIndex);
-  if (!existsSync(rootPath)) writeRoot([]);
+  if (!existsSync(rootPath)) writeRoot([], []);
 }
 
 function repoRelative(inputPath: string) {
@@ -238,24 +265,35 @@ export function canonicalize(value: JsonValue): string {
 }
 
 function withoutHash(node: SemanticNode): JsonValue {
+  const { hash: _hash, lifecycle: _lifecycle, ...payload } = node;
+  return payload as JsonValue;
+}
+
+function withoutHashWithLifecycle(node: SemanticNode): JsonValue {
   const { hash: _hash, ...payload } = node;
   return payload as JsonValue;
 }
 
-function rootPayload(nodes: string[]): JsonValue {
+function rootPayload(nodes: string[], supersededNodes: string[]): JsonValue {
   return {
     schemaVersion: 1,
+    activeNodes: nodes,
     nodes,
+    supersededNodes,
     indexes: {
       sourceIndex: sourceIndexDisplayPath,
     },
   };
 }
 
-export function rootPayloadForSourceIndex(nodes: string[], sourceIndex: string): JsonValue {
+export function rootPayloadForSourceIndex(nodes: string[], sourceIndex: string, supersededNodes: string[] = []): JsonValue {
+  const activeNodes = [...new Set(nodes)].sort();
+  const archivedNodes = [...new Set(supersededNodes)].sort();
   return {
     schemaVersion: 1,
-    nodes,
+    activeNodes,
+    nodes: activeNodes,
+    supersededNodes: archivedNodes,
     indexes: {
       sourceIndex,
     },
@@ -266,12 +304,12 @@ export function nodeHash(node: SemanticNode) {
   return sha256Text(canonicalize(withoutHash(node)));
 }
 
-function rootHash(nodes: string[]) {
-  return sha256Text(canonicalize(rootPayload(nodes)));
+function rootHash(nodes: string[], supersededNodes: string[]) {
+  return sha256Text(canonicalize(rootPayload(nodes, supersededNodes)));
 }
 
-export function rootHashForSourceIndex(nodes: string[], sourceIndex: string) {
-  return sha256Text(canonicalize(rootPayloadForSourceIndex(nodes, sourceIndex)));
+export function rootHashForSourceIndex(nodes: string[], sourceIndex: string, supersededNodes: string[] = []) {
+  return sha256Text(canonicalize(rootPayloadForSourceIndex(nodes, sourceIndex, supersededNodes)));
 }
 
 function writeJson(filePath: string, value: JsonValue) {
@@ -282,12 +320,27 @@ function readJson<T>(filePath: string): T {
   return JSON.parse(readFileSync(filePath, "utf8")) as T;
 }
 
-function writeRoot(nodes: string[]) {
+function activeNodesOf(root: RootFile) {
+  return [...new Set(root.activeNodes ?? root.nodes ?? [])].sort();
+}
+
+function supersededNodesOf(root: RootFile) {
+  return [...new Set(root.supersededNodes ?? [])].sort();
+}
+
+function allRootNodes(root: RootFile) {
+  return [...new Set([...activeNodesOf(root), ...supersededNodesOf(root)])].sort();
+}
+
+function writeRoot(nodes: string[], supersededNodes: string[] = []) {
   const sortedNodes = [...new Set(nodes)].sort();
+  const sortedSupersededNodes = [...new Set(supersededNodes)].sort();
   const root: RootFile = {
     schemaVersion: 1,
-    contextRoot: rootHash(sortedNodes),
+    contextRoot: rootHash(sortedNodes, sortedSupersededNodes),
+    activeNodes: sortedNodes,
     nodes: sortedNodes,
+    supersededNodes: sortedSupersededNodes,
     indexes: {
       sourceIndex: sourceIndexDisplayPath,
     },
@@ -311,6 +364,38 @@ function writeSourceIndex(index: SourceIndex) {
 
 function nodePath(hash: string) {
   return path.join(nodesDir, `${hash.replace("sha256:", "")}.json`);
+}
+
+function activeLifecycle(): SemanticNode["lifecycle"] {
+  return {
+    state: "active",
+    supersedes: [],
+    supersededBy: null,
+  };
+}
+
+function lifecycleOf(node: SemanticNode): SemanticNode["lifecycle"] {
+  return node.lifecycle ?? activeLifecycle();
+}
+
+function writeNode(node: SemanticNode) {
+  writeJson(nodePath(node.hash), node as unknown as JsonValue);
+}
+
+function readNode(hash: string) {
+  return readJson<SemanticNode>(nodePath(hash));
+}
+
+function rebuildSourceIndex(activeHashes: string[]) {
+  const sources: Record<string, string[]> = {};
+  for (const hash of activeHashes) {
+    const filePath = nodePath(hash);
+    if (!existsSync(filePath)) continue;
+    const node = readJson<SemanticNode>(filePath);
+    const sourcePath = node.sourceAnchor.path;
+    sources[sourcePath] = [...(sources[sourcePath] ?? []), hash];
+  }
+  writeSourceIndex({ schemaVersion: 1, sources });
 }
 
 function findMakeBindingMutableAnchor(source: string): SourceRange | null {
@@ -378,6 +463,7 @@ function makeTyp009RepairMemoryNode(sourcePath: string): SemanticNode {
       },
     },
     parents: [],
+    lifecycle: activeLifecycle(),
     hash: "",
   };
   node.hash = nodeHash(node);
@@ -436,19 +522,69 @@ function makeRepairMemoryNodeFromFix(sourcePath: string, fix: { diagnosticCode: 
       },
     },
     parents: [],
+    lifecycle: activeLifecycle(),
     hash: "",
   };
   node.hash = nodeHash(node);
   return node;
 }
 
-function storeNode(node: SemanticNode) {
-  writeJson(nodePath(node.hash), node as unknown as JsonValue);
+function findActiveNodeById(root: RootFile, nodeId: string) {
+  for (const hash of activeNodesOf(root)) {
+    const filePath = nodePath(hash);
+    if (!existsSync(filePath)) continue;
+    const node = readJson<SemanticNode>(filePath);
+    if (node.nodeId === nodeId) return { hash, node };
+  }
+  return null;
+}
+
+function storeNode(node: SemanticNode): StoreResult {
   const root = readRoot();
-  writeRoot([...root.nodes, node.hash]);
-  const index = readSourceIndex();
-  index.sources[node.sourceAnchor.path] = [...(index.sources[node.sourceAnchor.path] ?? []), node.hash];
-  writeSourceIndex(index);
+  let activeNodes = activeNodesOf(root);
+  let supersededNodes = supersededNodesOf(root);
+  const prior = findActiveNodeById(root, node.nodeId);
+  node.lifecycle = activeLifecycle();
+  if (!prior) {
+    node.parents = [];
+    node.hash = nodeHash(node);
+    writeNode(node);
+    activeNodes = [...activeNodes, node.hash];
+    writeRoot(activeNodes, supersededNodes);
+    rebuildSourceIndex(activeNodes);
+    return { action: "added", node, supersededHash: null };
+  }
+  node.parents = prior.node.parents;
+  node.hash = nodeHash(node);
+  if (prior.hash === node.hash) {
+    const activeNode = { ...prior.node, lifecycle: activeLifecycle() };
+    writeNode(activeNode);
+    writeRoot(activeNodes, supersededNodes);
+    rebuildSourceIndex(activeNodes);
+    return { action: "unchanged", node: activeNode, supersededHash: null };
+  }
+  node.parents = [prior.hash];
+  node.lifecycle = {
+    state: "active",
+    supersedes: [prior.hash],
+    supersededBy: null,
+  };
+  node.hash = nodeHash(node);
+  const supersededNode = {
+    ...prior.node,
+    lifecycle: {
+      ...lifecycleOf(prior.node),
+      state: "superseded" as const,
+      supersededBy: node.hash,
+    },
+  };
+  writeNode(supersededNode);
+  writeNode(node);
+  activeNodes = activeNodes.map((hash) => hash === prior.hash ? node.hash : hash);
+  supersededNodes = [...supersededNodes, prior.hash];
+  writeRoot(activeNodes, supersededNodes);
+  rebuildSourceIndex(activeNodes);
+  return { action: "superseded", node, supersededHash: prior.hash };
 }
 
 function commandInit() {
@@ -467,15 +603,19 @@ function commandCaptureRepair(sourceOption: string | boolean | undefined) {
   ensureLayout();
   const source = repoRelative(sourceOption);
   const node = makeTyp009RepairMemoryNode(source);
-  storeNode(node);
+  const stored = storeNode(node);
   console.log(JSON.stringify({
     schemaVersion: 1,
     mode: "context-capture-repair",
+    action: stored.action,
+    supersededHash: stored.supersededHash,
     node: {
-      kind: node.kind,
-      nodeId: node.nodeId,
-      hash: node.hash,
-      sourceFile: node.sourceAnchor.path,
+      kind: stored.node.kind,
+      nodeId: stored.node.nodeId,
+      hash: stored.node.hash,
+      lifecycle: stored.node.lifecycle,
+      parents: stored.node.parents,
+      sourceFile: stored.node.sourceAnchor.path,
     },
   }, null, 2));
 }
@@ -769,16 +909,16 @@ function commandCaptureFixPlan(sourceOption: string | boolean | undefined, fixPl
         });
         continue;
       }
-      const node = makeRepairMemoryNodeFromFix(source, fix, edits);
-      storeNode(node);
+      const stored = storeNode(makeRepairMemoryNodeFromFix(source, fix, edits));
       captured.push({
-        nodeId: node.nodeId,
-        hash: node.hash,
-        diagnosticCode: node.diagnosticCode,
-        repairId: node.repairId,
+        nodeId: stored.node.nodeId,
+        hash: stored.node.hash,
+        action: stored.action,
+        diagnosticCode: stored.node.diagnosticCode,
+        repairId: stored.node.repairId,
         sourceAnchor: {
-          path: node.sourceAnchor.path,
-          range: node.sourceAnchor.range,
+          path: stored.node.sourceAnchor.path,
+          range: stored.node.sourceAnchor.range,
         },
       });
     }
@@ -800,6 +940,8 @@ function projectNode(node: SemanticNode) {
     kind: node.kind,
     nodeId: node.nodeId,
     hash: node.hash,
+    lifecycle: lifecycleOf(node),
+    parents: node.parents,
     codes: node.codes,
     diagnosticCode: node.diagnosticCode,
     repairId: node.repairId,
@@ -808,15 +950,24 @@ function projectNode(node: SemanticNode) {
   };
 }
 
-function commandProject(sourceOption: string | boolean | undefined) {
+function commandProject(sourceOption: string | boolean | undefined, includeSupersededOption: string | boolean | undefined) {
   if (typeof sourceOption !== "string") usage();
   ensureLayout();
   const source = repoRelative(sourceOption);
   const diagnostics: Diagnostic[] = [];
   const index = readSourceIndex();
-  const hashes = index.sources[source] ?? [];
+  const root = readRoot();
+  const hashes = [...(index.sources[source] ?? [])];
+  if (includeSupersededOption === true) {
+    for (const hash of supersededNodesOf(root)) {
+      const filePath = nodePath(hash);
+      if (!existsSync(filePath)) continue;
+      const node = readJson<SemanticNode>(filePath);
+      if (node.sourceAnchor.path === source) hashes.push(hash);
+    }
+  }
   const nodes = [];
-  for (const hash of hashes) {
+  for (const hash of [...new Set(hashes)]) {
     const filePath = nodePath(hash);
     if (!existsSync(filePath)) {
       diagnostics.push({ code: "CTX001", message: "indexed context node is missing", path: source, hash });
@@ -841,6 +992,7 @@ function verifyNode(node: SemanticNode, filePath: string, diagnostics: Diagnosti
   const result: NodeVerification = {
     hash: node.hash,
     nodeId: node.nodeId,
+    lifecycle: lifecycleOf(node),
     sourceAnchor: {
       path: node.sourceAnchor.path,
       status: node.sourceAnchor.status,
@@ -917,12 +1069,15 @@ function verifyNode(node: SemanticNode, filePath: string, diagnostics: Diagnosti
   return result;
 }
 
-function commandVerify() {
+function commandVerify(includeSupersededOption: string | boolean | undefined) {
   ensureLayout();
   const diagnostics: Diagnostic[] = [];
   const nodeResults: NodeVerification[] = [];
   const root = readRoot();
-  const expectedRoot = rootHash(root.nodes);
+  const activeNodes = activeNodesOf(root);
+  const supersededNodes = supersededNodesOf(root);
+  const checkedHashes = includeSupersededOption === true ? allRootNodes(root) : activeNodes;
+  const expectedRoot = rootHash(activeNodes, supersededNodes);
   if (root.contextRoot !== expectedRoot) {
     pushDiagnostic(diagnostics, {
       code: "CTX-ROOT",
@@ -934,7 +1089,7 @@ function commandVerify() {
   }
   const index = readSourceIndex();
   const indexedHashes = new Set(Object.values(index.sources).flat());
-  for (const hash of root.nodes) {
+  for (const hash of checkedHashes) {
     const filePath = nodePath(hash);
     if (!existsSync(filePath)) {
       pushDiagnostic(diagnostics, { code: "CTX001", message: "context root references missing node", path: filePath, hash });
@@ -942,19 +1097,20 @@ function commandVerify() {
     }
     const node = readJson<SemanticNode>(filePath);
     nodeResults.push(verifyNode(node, filePath, diagnostics));
-    if (!indexedHashes.has(hash)) {
+    if (lifecycleOf(node).state === "active" && !indexedHashes.has(hash)) {
       pushDiagnostic(diagnostics, { code: "CTX-INDEX", nodeId: node.nodeId, message: "context node is missing from source index", path: node.sourceAnchor.path, hash });
     }
   }
+  const referencedHashes = new Set(allRootNodes(root));
   for (const filename of existsSync(nodesDir) ? readdirSync(nodesDir).filter((item) => item.endsWith(".json")) : []) {
     const hash = `sha256:${filename.slice(0, -".json".length)}`;
-    if (!root.nodes.includes(hash)) pushDiagnostic(diagnostics, { code: "CTX-ORPHAN", message: "node file is not referenced by root", path: displayPath(path.join(nodesDir, filename)), hash });
+    if (!referencedHashes.has(hash)) pushDiagnostic(diagnostics, { code: "CTX-ORPHAN", message: "node file is not referenced by root", path: displayPath(path.join(nodesDir, filename)), hash });
   }
   console.log(JSON.stringify({
     schemaVersion: 1,
     mode: "context-verify",
     ok: diagnostics.length === 0,
-    checkedNodes: root.nodes.length,
+    checkedNodes: checkedHashes.length,
     nodes: nodeResults,
     diagnostics,
   }, null, 2));
@@ -983,6 +1139,7 @@ function loadContext(input: string): LoadedContext {
     nodesDir: resolved.nodesDir,
     root: null,
     nodesById: new Map(),
+    nodesByHash: new Map(),
     diagnostics,
   };
   if (!existsSync(resolved.rootPath)) {
@@ -1011,7 +1168,8 @@ function loadContext(input: string): LoadedContext {
     });
     return loaded;
   }
-  for (const hash of loaded.root.nodes) {
+  const activeHashes = new Set(activeNodesOf(loaded.root));
+  for (const hash of allRootNodes(loaded.root)) {
     const filePath = path.join(resolved.nodesDir, `${hash.replace("sha256:", "")}.json`);
     if (!existsSync(filePath)) {
       pushDiagnostic(diagnostics, {
@@ -1024,7 +1182,8 @@ function loadContext(input: string): LoadedContext {
     }
     try {
       const node = readJson<SemanticNode>(filePath);
-      if (loaded.nodesById.has(node.nodeId)) {
+      loaded.nodesByHash.set(hash, node);
+      if (activeHashes.has(hash) && loaded.nodesById.has(node.nodeId)) {
         pushDiagnostic(diagnostics, {
           code: "CTX_DIFF_DUPLICATE_NODE_ID",
           nodeId: node.nodeId,
@@ -1032,7 +1191,7 @@ function loadContext(input: string): LoadedContext {
           path: displayPath(filePath),
         });
       }
-      loaded.nodesById.set(node.nodeId, node);
+      if (activeHashes.has(hash)) loaded.nodesById.set(node.nodeId, node);
     } catch (error) {
       pushDiagnostic(diagnostics, {
         code: "CTX_DIFF_NODE_MALFORMED",
@@ -1050,6 +1209,7 @@ function summarizeNode(node: SemanticNode): NodeSummary {
     hash: node.hash,
     nodeId: node.nodeId,
     kind: node.kind,
+    lifecycle: lifecycleOf(node),
   };
 }
 
@@ -1080,7 +1240,7 @@ function diffValues(pathName: string, fromValue: JsonValue, toValue: JsonValue, 
 
 function diffNodes(fromNode: SemanticNode, toNode: SemanticNode) {
   const changes: NodeChange[] = [];
-  diffValues("", withoutHash(fromNode), withoutHash(toNode), changes);
+  diffValues("", withoutHashWithLifecycle(fromNode), withoutHashWithLifecycle(toNode), changes);
   return {
     nodeId: toNode.nodeId,
     fromHash: fromNode.hash,
@@ -1099,6 +1259,7 @@ function commandDiff(fromOption: string | boolean | undefined, toOption: string 
   const removed: NodeSummary[] = [];
   const changed = [];
   const unchanged: NodeSummary[] = [];
+  const lifecycleChanged = [];
   if (fromContext.root && toContext.root) {
     const nodeIds = new Set([...fromContext.nodesById.keys(), ...toContext.nodesById.keys()]);
     for (const nodeId of [...nodeIds].sort()) {
@@ -1108,10 +1269,26 @@ function commandDiff(fromOption: string | boolean | undefined, toOption: string 
         added.push(summarizeNode(toNode));
       } else if (fromNode && !toNode) {
         removed.push(summarizeNode(fromNode));
-      } else if (fromNode && toNode && fromNode.hash === toNode.hash) {
+      } else if (fromNode && toNode && canonicalize(withoutHashWithLifecycle(fromNode)) === canonicalize(withoutHashWithLifecycle(toNode))) {
         unchanged.push(summarizeNode(toNode));
       } else if (fromNode && toNode) {
         changed.push(diffNodes(fromNode, toNode));
+      }
+    }
+    const hashes = new Set([...fromContext.nodesByHash.keys(), ...toContext.nodesByHash.keys()]);
+    for (const hash of [...hashes].sort()) {
+      const fromNode = fromContext.nodesByHash.get(hash);
+      const toNode = toContext.nodesByHash.get(hash);
+      if (!fromNode || !toNode) continue;
+      const fromLifecycle = lifecycleOf(fromNode);
+      const toLifecycle = lifecycleOf(toNode);
+      if (canonicalize(fromLifecycle as unknown as JsonValue) !== canonicalize(toLifecycle as unknown as JsonValue)) {
+        lifecycleChanged.push({
+          hash,
+          nodeId: toNode.nodeId,
+          from: fromLifecycle,
+          to: toLifecycle,
+        });
       }
     }
   }
@@ -1130,12 +1307,14 @@ function commandDiff(fromOption: string | boolean | undefined, toOption: string 
       removed: removed.length,
       changed: changed.length,
       unchanged: unchanged.length,
+      lifecycleChanged: lifecycleChanged.length,
     },
     nodes: {
       added,
       removed,
       changed,
       unchanged,
+      lifecycleChanged,
     },
     diagnostics,
   }, null, 2));
@@ -1148,8 +1327,8 @@ export function main(argv = process.argv.slice(2)) {
   if (command === "init") commandInit();
   else if (command === "capture-repair") commandCaptureRepair(options.source);
   else if (command === "capture-fix-plan") commandCaptureFixPlan(options.source, options.fixPlanJson);
-  else if (command === "project") commandProject(options.source);
-  else if (command === "verify") commandVerify();
+  else if (command === "project") commandProject(options.source, options.includeSuperseded);
+  else if (command === "verify") commandVerify(options.includeSuperseded);
   else if (command === "diff") commandDiff(options.from, options.to);
   else usage();
 }

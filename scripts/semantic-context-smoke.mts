@@ -71,7 +71,9 @@ function mutateResidualSummary(dir: string, summary: string) {
   writeFileSync(newNodePath, `${JSON.stringify(node, null, 2)}\n`);
   rmSync(oldNodePath, { force: true });
   root.nodes = [node.hash];
-  root.contextRoot = rootHashForSourceIndex(root.nodes, indexPath.split(path.sep).join("/"));
+  root.activeNodes = [node.hash];
+  root.supersededNodes = root.supersededNodes ?? [];
+  root.contextRoot = rootHashForSourceIndex(root.nodes, indexPath.split(path.sep).join("/"), root.supersededNodes);
   writeFileSync(rootPath, `${JSON.stringify(root, null, 2)}\n`);
   const index = JSON.parse(readFileSync(indexPath, "utf8"));
   index.sources[node.sourceAnchor.path] = [node.hash];
@@ -90,12 +92,20 @@ try {
 
   const capture = run(["capture-repair", "--source", source]);
   assert.equal(capture.mode, "context-capture-repair");
+  assert.equal(capture.action, "added");
   assert.equal(capture.node.kind, "repair-memory");
   assert.equal(capture.node.nodeId, "ctx:repair-memory:typ009:make-binding-mutable");
+  assert.deepEqual(capture.node.parents, []);
+  assert.equal(capture.node.lifecycle.state, "active");
   assert.match(capture.node.hash, /^sha256:[0-9a-f]{64}$/);
 
   const secondCapture = run(["capture-repair", "--source", source]);
+  assert.equal(secondCapture.action, "unchanged");
   assert.equal(secondCapture.node.hash, capture.node.hash);
+  const repeatedRoot = JSON.parse(readFileSync(path.join(storage, "root.json"), "utf8"));
+  assert.deepEqual(repeatedRoot.nodes, [capture.node.hash]);
+  assert.deepEqual(repeatedRoot.activeNodes, [capture.node.hash]);
+  assert.deepEqual(repeatedRoot.supersededNodes, []);
 
   const project = run(["project", "--source", source, "--json"]);
   assert.equal(project.schemaVersion, 1);
@@ -142,6 +152,9 @@ try {
   assert.equal(existsSync(nodeFile), true);
   const storedNode = JSON.parse(readFileSync(nodeFile, "utf8"));
   assert.equal(storedNode.hash, capture.node.hash);
+  assert.equal(storedNode.lifecycle.state, "active");
+  assert.deepEqual(storedNode.lifecycle.supersedes, []);
+  assert.equal(storedNode.lifecycle.supersededBy, null);
   assert.match(storedNode.sourceAnchor.sourceHash, /^sha256:[0-9a-f]{64}$/);
 
   resetStorage();
@@ -151,6 +164,7 @@ try {
   assert.equal(fixPlanCapture.ok, true);
   assert.equal(fixPlanCapture.sourceFile, source);
   assert.equal(fixPlanCapture.captured.length, 1);
+  assert.equal(fixPlanCapture.captured[0].action, "added");
   assert.equal(fixPlanCapture.captured[0].nodeId, "ctx:repair-memory:typ009:make-binding-mutable");
   assert.equal(fixPlanCapture.captured[0].diagnosticCode, "TYP009");
   assert.equal(fixPlanCapture.captured[0].repairId, "make-binding-mutable");
@@ -206,10 +220,75 @@ try {
   const previewCapture = run(["capture-fix-plan", "--source", source, "--fix-plan-json", previewPlan]);
   assert.equal(previewCapture.ok, true);
   assert.equal(previewCapture.captured.length, 1);
+  assert.equal(previewCapture.captured[0].action, "added");
   assert.equal(previewCapture.captured[0].nodeId, "ctx:repair-memory:typ009:make-binding-mutable");
   const previewVerify = run(["verify", "--json"]);
   assert.equal(previewVerify.ok, true);
   assert.equal(previewVerify.nodes[0].preconditions[0].actual, "let");
+
+  const lifecyclePlan = tempJson("lifecycle-plan.json", {
+    schemaVersion: 1,
+    mode: "plan",
+    input: source,
+    fixes: [
+      {
+        id: "make-binding-mutable",
+        diagnosticCode: "TYP009",
+        safety: "behavior-preserving",
+        summary: "Changed lifecycle summary.",
+        hasPreview: true,
+        edits: [
+          {
+            path: source,
+            range: {
+              start: { line: 2, column: 5 },
+              end: { line: 2, column: 8 },
+              columnUnit: "utf8-byte",
+            },
+            oldText: "let",
+            newText: "let mut",
+            precondition: { kind: "exact-text", text: "let" },
+          },
+        ],
+      },
+    ],
+  });
+  const lifecycleCapture = run(["capture-fix-plan", "--source", source, "--fix-plan-json", lifecyclePlan]);
+  assert.equal(lifecycleCapture.ok, true);
+  assert.equal(lifecycleCapture.captured.length, 1);
+  assert.equal(lifecycleCapture.captured[0].action, "superseded");
+  assert.notEqual(lifecycleCapture.captured[0].hash, previewCapture.captured[0].hash);
+
+  const lifecycleRoot = JSON.parse(readFileSync(path.join(storage, "root.json"), "utf8"));
+  assert.deepEqual(lifecycleRoot.nodes, [lifecycleCapture.captured[0].hash]);
+  assert.deepEqual(lifecycleRoot.activeNodes, [lifecycleCapture.captured[0].hash]);
+  assert.deepEqual(lifecycleRoot.supersededNodes, [previewCapture.captured[0].hash]);
+  const lifecycleIndex = JSON.parse(readFileSync(path.join(storage, "indexes/source-index.json"), "utf8"));
+  assert.deepEqual(lifecycleIndex.sources[source], [lifecycleCapture.captured[0].hash]);
+
+  const oldLifecycleNode = JSON.parse(readFileSync(path.join(storage, "nodes", `${previewCapture.captured[0].hash.replace("sha256:", "")}.json`), "utf8"));
+  const newLifecycleNode = JSON.parse(readFileSync(path.join(storage, "nodes", `${lifecycleCapture.captured[0].hash.replace("sha256:", "")}.json`), "utf8"));
+  assert.equal(oldLifecycleNode.lifecycle.state, "superseded");
+  assert.equal(oldLifecycleNode.lifecycle.supersededBy, lifecycleCapture.captured[0].hash);
+  assert.equal(newLifecycleNode.lifecycle.state, "active");
+  assert.deepEqual(newLifecycleNode.parents, [previewCapture.captured[0].hash]);
+  assert.deepEqual(newLifecycleNode.lifecycle.supersedes, [previewCapture.captured[0].hash]);
+
+  const lifecycleProject = run(["project", "--source", source, "--json"]);
+  assert.equal(lifecycleProject.nodes.length, 1);
+  assert.equal(lifecycleProject.nodes[0].hash, lifecycleCapture.captured[0].hash);
+  assert.equal(lifecycleProject.nodes[0].lifecycle.state, "active");
+  const lifecycleProjectWithSuperseded = run(["project", "--source", source, "--json", "--include-superseded"]);
+  assert.equal(lifecycleProjectWithSuperseded.nodes.length, 2);
+  assert(lifecycleProjectWithSuperseded.nodes.some((node: any) => node.hash === previewCapture.captured[0].hash && node.lifecycle.state === "superseded"));
+  const lifecycleVerify = run(["verify", "--json"]);
+  assert.equal(lifecycleVerify.ok, true);
+  assert.equal(lifecycleVerify.checkedNodes, 1);
+  assert.equal(lifecycleVerify.nodes[0].lifecycle.state, "active");
+  const lifecycleVerifyWithSuperseded = run(["verify", "--json", "--include-superseded"]);
+  assert.equal(lifecycleVerifyWithSuperseded.ok, true);
+  assert.equal(lifecycleVerifyWithSuperseded.checkedNodes, 2);
+  assert(lifecycleVerifyWithSuperseded.nodes.some((node: any) => node.hash === previewCapture.captured[0].hash && node.lifecycle.state === "superseded"));
 
   resetStorage();
   const noPreviewPlan = tempJson("no-preview-plan.json", {
@@ -309,7 +388,7 @@ try {
     assert.equal(identicalDiff.schemaVersion, 1);
     assert.equal(identicalDiff.mode, "context-diff");
     assert.equal(identicalDiff.ok, true);
-    assert.deepEqual(identicalDiff.summary, { added: 0, removed: 0, changed: 0, unchanged: 1 });
+    assert.deepEqual(identicalDiff.summary, { added: 0, removed: 0, changed: 0, unchanged: 1, lifecycleChanged: 0 });
     assert.equal(identicalDiff.nodes.unchanged[0].nodeId, "ctx:repair-memory:typ009:make-binding-mutable");
 
     resetStorage(addedA);
@@ -317,12 +396,12 @@ try {
     const addedCapture = captureContext(addedB);
     const addedDiff = run(["diff", "--from", addedA, "--to", addedB, "--json"]);
     assert.equal(addedDiff.ok, true);
-    assert.deepEqual(addedDiff.summary, { added: 1, removed: 0, changed: 0, unchanged: 0 });
+    assert.deepEqual(addedDiff.summary, { added: 1, removed: 0, changed: 0, unchanged: 0, lifecycleChanged: 0 });
     assert.equal(addedDiff.nodes.added[0].hash, addedCapture.node.hash);
 
     const removedDiff = run(["diff", "--from", addedB, "--to", addedA, "--json"]);
     assert.equal(removedDiff.ok, true);
-    assert.deepEqual(removedDiff.summary, { added: 0, removed: 1, changed: 0, unchanged: 0 });
+    assert.deepEqual(removedDiff.summary, { added: 0, removed: 1, changed: 0, unchanged: 0, lifecycleChanged: 0 });
     assert.equal(removedDiff.nodes.removed[0].hash, addedCapture.node.hash);
 
     captureContext(changedA);
@@ -330,7 +409,7 @@ try {
     const changedNode = mutateResidualSummary(changedB, "Changed residual summary for semantic diff testing.");
     const changedDiff = run(["diff", "--from", changedA, "--to", changedB, "--json"]);
     assert.equal(changedDiff.ok, true);
-    assert.deepEqual(changedDiff.summary, { added: 0, removed: 0, changed: 1, unchanged: 0 });
+    assert.deepEqual(changedDiff.summary, { added: 0, removed: 0, changed: 1, unchanged: 0, lifecycleChanged: 0 });
     assert.equal(changedDiff.nodes.changed[0].nodeId, "ctx:repair-memory:typ009:make-binding-mutable");
     assert.equal(changedDiff.nodes.changed[0].toHash, changedNode.hash);
     assert(changedDiff.nodes.changed[0].changes.some((change: any) =>
