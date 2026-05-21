@@ -1,8 +1,8 @@
-# Semantic Substrate Whitepaper Alignment
+# Semantic Substrate V1 Whitepaper Alignment
 
-The Semantic Merkle Substrate whitepaper frames a compiler-mediated system for preserving and projecting code meaning. The sidecar branch implements a concrete local subset of that design.
+The original Semantic Merkle Substrate v1 whitepaper frames a compiler-mediated system for preserving and projecting code meaning. Research and implementation have evolved since that draft. The sidecar branch implements a concrete local substrate with root history, events, timeline projection, compliance, policy, reconciliation, and generalized capture.
 
-This page maps the whitepaper concepts to the current implementation and identifies the next technical boundaries.
+This page maps the v1 whitepaper concepts to the current implementation and identifies the next technical boundaries. It is a bridge between the original research framing and the current sidecar contracts.
 
 ## Core Thesis
 
