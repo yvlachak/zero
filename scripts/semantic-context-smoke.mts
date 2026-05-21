@@ -61,6 +61,10 @@ function eventPath(dir: string, hash: string) {
   return path.join(dir, "events", `${hash.replace("sha256:", "")}.json`);
 }
 
+function nodePath(dir: string, hash: string) {
+  return path.join(dir, "nodes", `${hash.replace("sha256:", "")}.json`);
+}
+
 function eventHash(event: any) {
   const { eventHash: _eventHash, ...payload } = event;
   return `sha256:${createHash("sha256").update(canonicalize(payload)).digest("hex")}`;
@@ -354,6 +358,37 @@ try {
   assert.equal(allTimeline.events.length, 2);
   assert.deepEqual(allTimeline.diagnostics, []);
 
+  const compliance = run(["compliance", "--json"]);
+  assert.equal(compliance.schemaVersion, 1);
+  assert.equal(compliance.mode, "context-compliance");
+  assert.equal(compliance.ok, true);
+  assert.equal(compliance.scope.sourceFile, null);
+  assert.equal(compliance.root.currentRoot, repeatedCycle.rootTransition.currentRoot);
+  assert.equal(compliance.root.currentRootExists, true);
+  assert.equal(compliance.root.rootHashOk, true);
+  assert.equal(compliance.root.parentChainOk, true);
+  assert.equal(compliance.root.rootDepth, 2);
+  assert.equal(compliance.timeline.events, 2);
+  assert.equal(compliance.timeline.eventHashesOk, true);
+  assert.equal(compliance.timeline.rootReferencesOk, true);
+  assert.equal(compliance.timeline.missingRoots, 0);
+  assert.equal(compliance.timeline.hashFailures, 0);
+  assert.equal(compliance.nodes.active, 1);
+  assert.equal(compliance.nodes.superseded, 0);
+  assert.equal(compliance.nodes.nodeHashesOk, true);
+  assert.equal(compliance.nodes.lifecycleOk, true);
+  assert.equal(compliance.anchors.checked, 1);
+  assert.equal(compliance.anchors.ok, true);
+  assert.equal(compliance.indexes.sourceIndexOk, true);
+  assert.deepEqual(compliance.diagnostics, []);
+
+  const sourceCompliance = run(["compliance", "--source", source, "--json"]);
+  assert.equal(sourceCompliance.ok, true);
+  assert.equal(sourceCompliance.scope.sourceFile, source);
+  assert.equal(sourceCompliance.timeline.events, 2);
+  assert.equal(sourceCompliance.anchors.checked, 1);
+  assert.deepEqual(sourceCompliance.diagnostics, []);
+
   const tamperedEvent = {
     ...checkCycleEvent,
     rootChanged: false,
@@ -380,6 +415,71 @@ try {
     diagnostic.code === "CTX_TIMELINE_ROOT_MISSING" &&
     diagnostic.severity === "error"
   ));
+
+  const missingRootDir = path.join("/tmp", `zero-semantic-context-missing-root-${process.pid}`);
+  const tamperedEventDir = path.join("/tmp", `zero-semantic-context-tampered-event-${process.pid}`);
+  const tamperedNodeDir = path.join("/tmp", `zero-semantic-context-tampered-node-${process.pid}`);
+  const staleIndexDir = path.join("/tmp", `zero-semantic-context-stale-index-${process.pid}`);
+  try {
+    resetStorage(missingRootDir);
+    run(["init"], { storage: missingRootDir });
+    const missingRootCycle = run(["check-cycle", "--source", source, "--json"], { storage: missingRootDir });
+    rmSync(snapshotPath(missingRootDir, missingRootCycle.rootTransition.currentRoot), { force: true });
+    const missingRootCompliance = run(["compliance", "--json"], { storage: missingRootDir, allowFailure: true });
+    assert.equal(missingRootCompliance.ok, false);
+    assert.equal(missingRootCompliance.root.currentRootExists, false);
+    assert(missingRootCompliance.diagnostics.some((diagnostic: any) =>
+      diagnostic.code === "CTX_COMPLIANCE_ROOT_SNAPSHOT_MISSING" &&
+      diagnostic.severity === "error"
+    ));
+
+    resetStorage(tamperedEventDir);
+    run(["init"], { storage: tamperedEventDir });
+    const tamperedEventCycle = run(["check-cycle", "--source", source, "--json"], { storage: tamperedEventDir });
+    const tamperedEventFile = eventPath(tamperedEventDir, tamperedEventCycle.event.eventHash);
+    const complianceEvent = JSON.parse(readFileSync(tamperedEventFile, "utf8"));
+    complianceEvent.rootChanged = false;
+    writeFileSync(tamperedEventFile, `${JSON.stringify(complianceEvent, null, 2)}\n`);
+    const tamperedEventCompliance = run(["compliance", "--json"], { storage: tamperedEventDir, allowFailure: true });
+    assert.equal(tamperedEventCompliance.ok, false);
+    assert.equal(tamperedEventCompliance.timeline.eventHashesOk, false);
+    assert(tamperedEventCompliance.diagnostics.some((diagnostic: any) =>
+      diagnostic.code === "CTX_COMPLIANCE_EVENT_HASH_MISMATCH" &&
+      diagnostic.severity === "error"
+    ));
+
+    resetStorage(tamperedNodeDir);
+    run(["init"], { storage: tamperedNodeDir });
+    const tamperedNodeCycle = run(["check-cycle", "--source", source, "--json"], { storage: tamperedNodeDir });
+    const tamperedNodeFile = nodePath(tamperedNodeDir, tamperedNodeCycle.capture.captured[0].hash);
+    const complianceNode = JSON.parse(readFileSync(tamperedNodeFile, "utf8"));
+    complianceNode.residualSummary = "Tampered residual summary.";
+    writeFileSync(tamperedNodeFile, `${JSON.stringify(complianceNode, null, 2)}\n`);
+    const tamperedNodeCompliance = run(["compliance", "--json"], { storage: tamperedNodeDir, allowFailure: true });
+    assert.equal(tamperedNodeCompliance.ok, false);
+    assert.equal(tamperedNodeCompliance.nodes.nodeHashesOk, false);
+    assert(tamperedNodeCompliance.diagnostics.some((diagnostic: any) =>
+      diagnostic.code === "CTX_COMPLIANCE_NODE_HASH_MISMATCH" &&
+      diagnostic.severity === "error"
+    ));
+
+    resetStorage(staleIndexDir);
+    run(["init"], { storage: staleIndexDir });
+    run(["check-cycle", "--source", source, "--json"], { storage: staleIndexDir });
+    const staleIndexPath = path.join(staleIndexDir, "indexes/source-index.json");
+    const staleIndex = JSON.parse(readFileSync(staleIndexPath, "utf8"));
+    staleIndex.sources[source] = ["sha256:0000000000000000000000000000000000000000000000000000000000000000"];
+    writeFileSync(staleIndexPath, `${JSON.stringify(staleIndex, null, 2)}\n`);
+    const staleIndexCompliance = run(["compliance", "--json"], { storage: staleIndexDir, allowFailure: true });
+    assert.equal(staleIndexCompliance.ok, false);
+    assert.equal(staleIndexCompliance.indexes.sourceIndexOk, false);
+    assert(staleIndexCompliance.diagnostics.some((diagnostic: any) =>
+      diagnostic.code === "CTX_COMPLIANCE_SOURCE_INDEX_STALE" &&
+      diagnostic.severity === "error"
+    ));
+  } finally {
+    for (const dir of [missingRootDir, tamperedEventDir, tamperedNodeDir, staleIndexDir]) resetStorage(dir);
+  }
 
   resetStorage();
   const previewPlan = tempJson("preview-plan.json", {

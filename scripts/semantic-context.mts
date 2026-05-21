@@ -220,6 +220,14 @@ type TimelineEvent = {
   verification: ContextEvent["verification"];
 };
 
+type ComplianceRootState = {
+  pointer: RootPointer | null;
+  currentRootSnapshot: RootSnapshot | null;
+  rootHashOk: boolean;
+  parentChainOk: boolean;
+  rootDepth: number;
+};
+
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(scriptDir, "..");
 function displayPath(filePath: string) {
@@ -262,6 +270,7 @@ function usage(): never {
   semantic-context check-cycle --source <file> --json
   semantic-context events --json
   semantic-context timeline [--source <file>] --json
+  semantic-context compliance [--source <file>] --json
   semantic-context diff --from <context-dir-or-root-snapshot> --to <context-dir-or-root-snapshot> --json`);
   process.exit(1);
 }
@@ -1529,6 +1538,429 @@ function commandTimeline(sourceOption: string | boolean | undefined) {
   if (diagnostics.length > 0) process.exitCode = 1;
 }
 
+function rootHashFromSnapshot(root: RootSnapshot) {
+  return rootHashForSourceIndex(activeNodesOf(root), root.indexes.sourceIndex, supersededNodesOf(root), root.parentRoot, root.reason);
+}
+
+function isRootSnapshot(value: unknown): value is RootSnapshot {
+  return (
+    isObject(value) &&
+    value.schemaVersion === 1 &&
+    typeof value.contextRoot === "string" &&
+    (typeof value.parentRoot === "string" || value.parentRoot === null) &&
+    typeof value.reason === "string" &&
+    Array.isArray(value.activeNodes) &&
+    Array.isArray(value.supersededNodes) &&
+    Array.isArray(value.nodes) &&
+    isObject(value.indexes) &&
+    typeof value.indexes.sourceIndex === "string"
+  );
+}
+
+function readComplianceRoot(diagnostics: Diagnostic[]): ComplianceRootState {
+  const state: ComplianceRootState = {
+    pointer: null,
+    currentRootSnapshot: null,
+    rootHashOk: false,
+    parentChainOk: false,
+    rootDepth: 0,
+  };
+  if (!existsSync(rootPath)) {
+    pushDiagnostic(diagnostics, {
+      code: "CTX_COMPLIANCE_ROOT_MISSING",
+      message: "context root pointer does not exist",
+      path: displayPath(rootPath),
+    });
+    return state;
+  }
+  let pointerValue: unknown;
+  try {
+    pointerValue = readJson<unknown>(rootPath);
+  } catch (error) {
+    pushDiagnostic(diagnostics, {
+      code: "CTX_COMPLIANCE_ROOT_POINTER_MALFORMED",
+      message: error instanceof Error ? error.message : "context root pointer is not valid JSON",
+      path: displayPath(rootPath),
+    });
+    return state;
+  }
+  if (!isObject(pointerValue) || pointerValue.schemaVersion !== 1 || typeof pointerValue.currentRoot !== "string") {
+    pushDiagnostic(diagnostics, {
+      code: "CTX_COMPLIANCE_ROOT_POINTER_MALFORMED",
+      message: "context root pointer has an unsupported schema",
+      path: displayPath(rootPath),
+    });
+    return state;
+  }
+  state.pointer = pointerValue as RootPointer;
+  const visited = new Set<string>();
+  let currentHash: string | null = state.pointer.currentRoot;
+  let parentChainOk = true;
+  while (currentHash !== null) {
+    if (visited.has(currentHash)) {
+      parentChainOk = false;
+      pushDiagnostic(diagnostics, {
+        code: "CTX_COMPLIANCE_PARENT_CHAIN_BROKEN",
+        message: "context root parent chain contains a cycle",
+        hash: currentHash,
+        path: displayPath(rootSnapshotPath(currentHash)),
+      });
+      break;
+    }
+    visited.add(currentHash);
+    const snapshotPath = rootSnapshotPath(currentHash);
+    if (!existsSync(snapshotPath)) {
+      parentChainOk = false;
+      pushDiagnostic(diagnostics, {
+        code: currentHash === state.pointer.currentRoot ? "CTX_COMPLIANCE_ROOT_SNAPSHOT_MISSING" : "CTX_COMPLIANCE_PARENT_ROOT_MISSING",
+        message: currentHash === state.pointer.currentRoot ? "current root snapshot does not exist" : "parent root snapshot does not exist",
+        hash: currentHash,
+        path: displayPath(snapshotPath),
+      });
+      break;
+    }
+    let snapshotValue: unknown;
+    try {
+      snapshotValue = readJson<unknown>(snapshotPath);
+    } catch (error) {
+      parentChainOk = false;
+      pushDiagnostic(diagnostics, {
+        code: "CTX_COMPLIANCE_PARENT_CHAIN_BROKEN",
+        message: error instanceof Error ? error.message : "root snapshot is not valid JSON",
+        hash: currentHash,
+        path: displayPath(snapshotPath),
+      });
+      break;
+    }
+    if (!isRootSnapshot(snapshotValue)) {
+      parentChainOk = false;
+      pushDiagnostic(diagnostics, {
+        code: "CTX_COMPLIANCE_PARENT_CHAIN_BROKEN",
+        message: "root snapshot has an unsupported schema",
+        hash: currentHash,
+        path: displayPath(snapshotPath),
+      });
+      break;
+    }
+    const snapshot = snapshotValue;
+    state.rootDepth += 1;
+    if (currentHash === state.pointer.currentRoot) state.currentRootSnapshot = snapshot;
+    const expectedRoot = rootHashFromSnapshot(snapshot);
+    if (snapshot.contextRoot !== currentHash || snapshot.contextRoot !== expectedRoot) {
+      parentChainOk = false;
+      if (currentHash === state.pointer.currentRoot) state.rootHashOk = false;
+      pushDiagnostic(diagnostics, {
+        code: "CTX_COMPLIANCE_ROOT_HASH_MISMATCH",
+        message: "root snapshot hash does not match canonical payload",
+        hash: currentHash,
+        path: displayPath(snapshotPath),
+        expected: snapshot.contextRoot,
+        actual: expectedRoot,
+      });
+    } else if (currentHash === state.pointer.currentRoot) {
+      state.rootHashOk = true;
+    }
+    currentHash = snapshot.parentRoot;
+  }
+  state.parentChainOk = parentChainOk && state.currentRootSnapshot !== null;
+  return state;
+}
+
+function readComplianceEvents(source: string | null, diagnostics: Diagnostic[]) {
+  const events: Array<{ event: ContextEvent; eventHashOk: boolean }> = [];
+  for (const filename of eventFilenames()) {
+    const filePath = path.join(eventsDir, filename);
+    const display = displayPath(filePath);
+    let value: unknown;
+    try {
+      value = readJson<unknown>(filePath);
+    } catch (error) {
+      pushDiagnostic(diagnostics, {
+        code: "CTX_COMPLIANCE_EVENT_MALFORMED",
+        message: error instanceof Error ? error.message : "context event is not valid JSON",
+        path: display,
+      });
+      continue;
+    }
+    if (!isContextEvent(value)) {
+      pushDiagnostic(diagnostics, {
+        code: "CTX_COMPLIANCE_EVENT_MALFORMED",
+        message: "context event has an unsupported schema",
+        path: display,
+      });
+      continue;
+    }
+    if (source !== null && value.sourceFile !== source) continue;
+    const actualHash = contextEventHash(value);
+    const eventHashOk = value.eventHash === actualHash;
+    if (!eventHashOk) {
+      pushDiagnostic(diagnostics, {
+        code: "CTX_COMPLIANCE_EVENT_HASH_MISMATCH",
+        message: "context event hash does not match canonical payload",
+        path: display,
+        expected: value.eventHash,
+        actual: actualHash,
+      });
+    }
+    for (const rootHashValue of [value.previousRoot, value.currentRoot]) {
+      if (!rootExists(rootHashValue)) {
+        pushDiagnostic(diagnostics, {
+          code: "CTX_COMPLIANCE_EVENT_ROOT_MISSING",
+          message: "context event references a missing root snapshot",
+          hash: rootHashValue,
+          path: displayPath(rootSnapshotPath(rootHashValue)),
+        });
+      }
+    }
+    events.push({ event: value, eventHashOk });
+  }
+  return events.sort((left, right) => left.event.eventId.localeCompare(right.event.eventId));
+}
+
+function verifyAnchorOnly(node: SemanticNode, diagnostics: Diagnostic[]) {
+  const sourcePath = path.join(repoRoot, node.sourceAnchor.path);
+  if (!existsSync(sourcePath)) {
+    pushDiagnostic(diagnostics, {
+      code: "CTX_SOURCE_MISSING",
+      nodeId: node.nodeId,
+      message: "source anchor path does not exist",
+      path: node.sourceAnchor.path,
+    });
+    return false;
+  }
+  const source = readText(node.sourceAnchor.path);
+  const currentSourceHash = sha256File(node.sourceAnchor.path);
+  let ok = true;
+  if (node.sourceAnchor.sourceHash !== null && node.sourceAnchor.sourceHash !== currentSourceHash) {
+    ok = false;
+    pushDiagnostic(diagnostics, {
+      code: "CTX_SOURCE_HASH_MISMATCH",
+      nodeId: node.nodeId,
+      message: "source anchor hash does not match current source",
+      path: node.sourceAnchor.path,
+      expected: node.sourceAnchor.sourceHash,
+      actual: currentSourceHash,
+    });
+  }
+  const extracted = extractRangeText(source, node.sourceAnchor.range);
+  if (!extracted.ok) {
+    pushDiagnostic(diagnostics, {
+      code: "CTX_ANCHOR_RANGE_INVALID",
+      nodeId: node.nodeId,
+      message: "source anchor range is invalid",
+      path: node.sourceAnchor.path,
+      actual: extracted.actual,
+    });
+    return false;
+  }
+  for (const edit of node.projection.frontier.edits) {
+    const precondition = edit.precondition;
+    if (!precondition || precondition.kind !== "exact-text") continue;
+    if (extracted.text !== precondition.text) {
+      ok = false;
+      pushDiagnostic(diagnostics, {
+        code: "CTX_PRECONDITION_MISMATCH",
+        nodeId: node.nodeId,
+        message: "source anchor text does not satisfy exact-text precondition",
+        path: node.sourceAnchor.path,
+        expected: precondition.text,
+        actual: extracted.text,
+      });
+    }
+  }
+  return ok;
+}
+
+function commandCompliance(sourceOption: string | boolean | undefined) {
+  const source = typeof sourceOption === "string" ? repoRelative(sourceOption) : null;
+  const diagnostics: Diagnostic[] = [];
+  const rootState = readComplianceRoot(diagnostics);
+  const events = readComplianceEvents(source, diagnostics);
+  const missingEventRoots = diagnostics.filter((diagnostic) => diagnostic.code === "CTX_COMPLIANCE_EVENT_ROOT_MISSING").length;
+  const eventHashFailures = events.filter(({ eventHashOk }) => !eventHashOk).length;
+  let sourceIndexOk = true;
+  let sourceIndex: SourceIndex | null = null;
+  if (!existsSync(sourceIndexPath)) {
+    sourceIndexOk = false;
+    pushDiagnostic(diagnostics, {
+      code: "CTX_COMPLIANCE_SOURCE_INDEX_MISSING",
+      message: "source index does not exist",
+      path: displayPath(sourceIndexPath),
+    });
+  } else {
+    try {
+      sourceIndex = readSourceIndex();
+    } catch (error) {
+      sourceIndexOk = false;
+      pushDiagnostic(diagnostics, {
+        code: "CTX_COMPLIANCE_SOURCE_INDEX_MISSING",
+        message: error instanceof Error ? error.message : "source index is not valid JSON",
+        path: displayPath(sourceIndexPath),
+      });
+    }
+  }
+
+  let active = 0;
+  let superseded = 0;
+  let nodeHashesOk = true;
+  let lifecycleOk = true;
+  let anchorsChecked = 0;
+  let anchorsOk = true;
+  const root = rootState.currentRootSnapshot;
+  const activeHashes = new Set(root ? activeNodesOf(root) : []);
+  const supersededHashes = new Set(root ? supersededNodesOf(root) : []);
+  if (root) {
+    const activeNodesBySource: Record<string, string[]> = {};
+    for (const hash of activeHashes) {
+      const filePath = nodePath(hash);
+      if (!existsSync(filePath)) {
+        nodeHashesOk = false;
+        pushDiagnostic(diagnostics, {
+          code: "CTX_COMPLIANCE_NODE_MISSING",
+          message: "active context node does not exist",
+          hash,
+          path: displayPath(filePath),
+        });
+        continue;
+      }
+      const node = readNode(hash);
+      active += 1;
+      activeNodesBySource[node.sourceAnchor.path] = [...(activeNodesBySource[node.sourceAnchor.path] ?? []), hash];
+      const actualHash = nodeHash(node);
+      if (node.hash !== actualHash || node.hash !== hash) {
+        nodeHashesOk = false;
+        pushDiagnostic(diagnostics, {
+          code: "CTX_COMPLIANCE_NODE_HASH_MISMATCH",
+          nodeId: node.nodeId,
+          message: "active context node hash does not match canonical payload",
+          hash,
+          path: displayPath(filePath),
+          expected: node.hash,
+          actual: actualHash,
+        });
+      }
+      if (lifecycleOf(node).state !== "active") {
+        lifecycleOk = false;
+        pushDiagnostic(diagnostics, {
+          code: "CTX_COMPLIANCE_ACTIVE_NODE_SUPERSEDED",
+          nodeId: node.nodeId,
+          message: "active root entry points to a superseded node",
+          hash,
+          path: displayPath(filePath),
+        });
+      }
+      if (source === null || node.sourceAnchor.path === source) {
+        anchorsChecked += 1;
+        if (!verifyAnchorOnly(node, diagnostics)) anchorsOk = false;
+      }
+    }
+    for (const hash of supersededHashes) {
+      const filePath = nodePath(hash);
+      if (!existsSync(filePath)) {
+        lifecycleOk = false;
+        pushDiagnostic(diagnostics, {
+          code: "CTX_COMPLIANCE_SUPERSEDED_NODE_MISSING",
+          message: "superseded context node does not exist",
+          hash,
+          path: displayPath(filePath),
+        });
+        continue;
+      }
+      const node = readNode(hash);
+      superseded += 1;
+      if (lifecycleOf(node).state === "active") {
+        lifecycleOk = false;
+        pushDiagnostic(diagnostics, {
+          code: "CTX_COMPLIANCE_SUPERSEDED_NODE_ACTIVE",
+          nodeId: node.nodeId,
+          message: "superseded root entry points to an active node",
+          hash,
+          path: displayPath(filePath),
+        });
+      }
+    }
+    if (sourceIndex) {
+      const indexedSources = source === null ? Object.keys(sourceIndex.sources).sort() : [source];
+      for (const sourcePath of indexedSources) {
+        for (const hash of sourceIndex.sources[sourcePath] ?? []) {
+          if (supersededHashes.has(hash)) {
+            sourceIndexOk = false;
+            pushDiagnostic(diagnostics, {
+              code: "CTX_COMPLIANCE_SOURCE_INDEX_POINTS_TO_SUPERSEDED",
+              message: "source index points to a superseded context node",
+              hash,
+              path: sourcePath,
+            });
+          } else if (!activeHashes.has(hash) || !existsSync(nodePath(hash))) {
+            sourceIndexOk = false;
+            pushDiagnostic(diagnostics, {
+              code: "CTX_COMPLIANCE_SOURCE_INDEX_STALE",
+              message: "source index points to a missing or inactive context node",
+              hash,
+              path: sourcePath,
+            });
+          }
+        }
+      }
+      const activeSourceEntries = source === null
+        ? Object.entries(activeNodesBySource)
+        : [[source, activeNodesBySource[source] ?? []] as [string, string[]]];
+      for (const [sourcePath, hashes] of activeSourceEntries) {
+        const indexedHashes = new Set(sourceIndex.sources[sourcePath] ?? []);
+        for (const hash of hashes) {
+          if (!indexedHashes.has(hash)) {
+            sourceIndexOk = false;
+            pushDiagnostic(diagnostics, {
+              code: "CTX_COMPLIANCE_SOURCE_INDEX_STALE",
+              message: "source index is missing an active context node",
+              hash,
+              path: sourcePath,
+            });
+          }
+        }
+      }
+    }
+  }
+  const result = {
+    schemaVersion: 1,
+    mode: "context-compliance",
+    ok: diagnostics.length === 0,
+    scope: {
+      sourceFile: source,
+    },
+    root: {
+      currentRoot: rootState.pointer?.currentRoot ?? null,
+      currentRootExists: rootState.currentRootSnapshot !== null,
+      rootHashOk: rootState.rootHashOk,
+      parentChainOk: rootState.parentChainOk,
+      rootDepth: rootState.rootDepth,
+    },
+    timeline: {
+      events: events.length,
+      eventHashesOk: eventHashFailures === 0,
+      rootReferencesOk: missingEventRoots === 0,
+      missingRoots: missingEventRoots,
+      hashFailures: eventHashFailures,
+    },
+    nodes: {
+      active,
+      superseded,
+      nodeHashesOk,
+      lifecycleOk,
+    },
+    anchors: {
+      checked: anchorsChecked,
+      ok: anchorsOk,
+    },
+    indexes: {
+      sourceIndexOk,
+    },
+    diagnostics,
+  };
+  console.log(JSON.stringify(result, null, 2));
+  if (diagnostics.length > 0) process.exitCode = 1;
+}
+
 function resolveContextInput(input: string) {
   if (input.startsWith("sha256:")) {
     return {
@@ -1773,6 +2205,7 @@ export function main(argv = process.argv.slice(2)) {
   else if (command === "check-cycle") commandCheckCycle(options.source);
   else if (command === "events") commandEvents();
   else if (command === "timeline") commandTimeline(options.source);
+  else if (command === "compliance") commandCompliance(options.source);
   else if (command === "diff") commandDiff(options.from, options.to);
   else usage();
 }
