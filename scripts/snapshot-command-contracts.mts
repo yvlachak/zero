@@ -671,6 +671,65 @@ function makeVerifyNode(sourceFile, sourceHash, precondition = "let") {
 }
 
 {
+  const ctxDir = join(outDir, "context-verify-index-missing-fixture");
+  const sourceFile = join(outDir, "context-verify-index-missing.0");
+  rmSync(ctxDir, { recursive: true, force: true });
+  writeFileSync(sourceFile, "let value = 1\n");
+  const node = makeVerifyNode(sourceFile, null);
+  node.projection.frontier.edits = [];
+  node.hash = contextNodeHash(node);
+  writeVerifyRoot(ctxDir, [node.hash], {}, [node]);
+  try {
+    const result = json(["context", "verify", "--json"], { allowFailure: true, env: { ZERO_CONTEXT_DIR: ctxDir } });
+    assert.equal(result.body.diagnostics.some((diagnostic) => diagnostic.code === "CTX-INDEX"), true);
+    assert.equal(result.code, 1);
+  } finally {
+    rmSync(ctxDir, { recursive: true, force: true });
+    rmSync(sourceFile, { force: true });
+  }
+}
+
+{
+  const ctxDir = join(outDir, "context-verify-source-hash-mismatch-fixture");
+  const sourceFile = join(outDir, "context-verify-source-hash-mismatch.0");
+  rmSync(ctxDir, { recursive: true, force: true });
+  writeFileSync(sourceFile, "let value = 1\n");
+  const node = makeVerifyNode(sourceFile, "sha256:0000000000000000000000000000000000000000000000000000000000000000");
+  writeVerifyRoot(ctxDir, [node.hash], { [sourceFile]: [node.hash] }, [node]);
+  try {
+    const result = json(["context", "verify", "--json"], { allowFailure: true, env: { ZERO_CONTEXT_DIR: ctxDir } });
+    assert.equal(result.body.diagnostics.some((diagnostic) => diagnostic.code === "CTX_SOURCE_HASH_MISMATCH"), true);
+    assert.equal(result.code, 1);
+  } finally {
+    rmSync(ctxDir, { recursive: true, force: true });
+    rmSync(sourceFile, { force: true });
+  }
+}
+
+{
+  const ctxDir = join(outDir, "context-verify-range-invalid-fixture");
+  const sourceFile = join(outDir, "context-verify-range-invalid.0");
+  rmSync(ctxDir, { recursive: true, force: true });
+  writeFileSync(sourceFile, "let value = 1\n");
+  const node = makeVerifyNode(sourceFile, `sha256:${sha256File(sourceFile)}`);
+  node.sourceAnchor.range = {
+    start: { line: 999, column: 1 },
+    end: { line: 999, column: 2 },
+    columnUnit: "utf8-byte",
+  };
+  node.hash = contextNodeHash(node);
+  writeVerifyRoot(ctxDir, [node.hash], { [sourceFile]: [node.hash] }, [node]);
+  try {
+    const result = json(["context", "verify", "--json"], { allowFailure: true, env: { ZERO_CONTEXT_DIR: ctxDir } });
+    assert.equal(result.body.diagnostics.some((diagnostic) => diagnostic.code === "CTX_ANCHOR_RANGE_INVALID"), true);
+    assert.equal(result.code, 1);
+  } finally {
+    rmSync(ctxDir, { recursive: true, force: true });
+    rmSync(sourceFile, { force: true });
+  }
+}
+
+{
   const ctxDir = join(outDir, "context-verify-precondition-fixture");
   const sourceFile = join(outDir, "context-verify-precondition.0");
   rmSync(ctxDir, { recursive: true, force: true });

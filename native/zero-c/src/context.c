@@ -250,6 +250,8 @@ static void context_json_append_escaped_string(ZBuf *out, const char *text) {
 }
 
 static bool context_json_canonicalize_value(ZBuf *out, const char **cursor, const char *const *excluded_keys, bool apply_exclusions);
+static int context_string_cmp(const void *left, const void *right);
+static char **context_json_string_array(const char *json, size_t *out_count);
 
 static bool context_json_canonicalize_string_value(ZBuf *out, const char **cursor) {
   const char *end = NULL;
@@ -454,6 +456,73 @@ char **context_source_index_hashes(const char *storage, const char *source_path,
     if (*cursor == ',') cursor++;
   }
   free(json);
+  return hashes;
+}
+
+char **context_source_index_all_hashes(const char *storage, size_t *out_count) {
+  if (out_count) *out_count = 0;
+  if (!storage || !out_count) return NULL;
+  char *indexes = context_join_path(storage, "indexes");
+  char *index_file = context_join_path(indexes, "source-index.json");
+  ZDiag diag = {0};
+  char *json = z_read_file(index_file, &diag);
+  free(indexes);
+  free(index_file);
+  if (!json) return NULL;
+
+  const char *sources = context_json_member_value(json, "sources");
+  sources = context_json_skip_ws(sources);
+  if (!sources || *sources != '{') {
+    free(json);
+    return NULL;
+  }
+  const char *sources_end = context_json_value_end(sources);
+  const char *cursor = sources + 1;
+  size_t cap = 0;
+  char **hashes = NULL;
+  while (cursor && sources_end && cursor < sources_end) {
+    cursor = context_json_skip_ws(cursor);
+    if (*cursor == '}') break;
+    if (*cursor != '"') break;
+    const char *key_end = NULL;
+    char *key = context_json_parse_string_at(cursor, &key_end);
+    free(key);
+    if (!key_end) break;
+    cursor = context_json_skip_ws(key_end);
+    if (*cursor != ':') break;
+    cursor = context_json_skip_ws(cursor + 1);
+    const char *value_end = context_json_value_end(cursor);
+    if (!value_end) break;
+    if (*cursor == '[') {
+      ZBuf raw;
+      zbuf_init(&raw);
+      context_zbuf_append_len(&raw, cursor, (size_t)(value_end - cursor));
+      size_t field_count = 0;
+      char **field_hashes = context_json_string_array(raw.data, &field_count);
+      for (size_t i = 0; i < field_count; i++) {
+        if (*out_count == cap) {
+          cap = cap ? cap * 2 : 8;
+          hashes = z_checked_reallocarray(hashes, cap, sizeof(char *));
+        }
+        hashes[(*out_count)++] = field_hashes[i];
+      }
+      free(field_hashes);
+      zbuf_free(&raw);
+    }
+    cursor = context_json_skip_ws(value_end);
+    if (*cursor == ',') cursor++;
+  }
+  free(json);
+  if (*out_count > 1) qsort(hashes, *out_count, sizeof(char *), context_string_cmp);
+  size_t write = 0;
+  for (size_t i = 0; i < *out_count; i++) {
+    if (write == 0 || strcmp(hashes[i], hashes[write - 1]) != 0) {
+      hashes[write++] = hashes[i];
+    } else {
+      free(hashes[i]);
+    }
+  }
+  *out_count = write;
   return hashes;
 }
 

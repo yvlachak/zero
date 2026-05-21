@@ -9670,6 +9670,8 @@ static int context_verify_command(const Command *command) {
     : context_root_active_hashes(root_snapshot_json, &checked_count);
   size_t referenced_count = 0;
   char **referenced_hashes = context_root_all_hashes(root_snapshot_json, &referenced_count);
+  size_t all_indexed_count = 0;
+  char **all_indexed_hashes = context_source_index_all_hashes(storage, &all_indexed_count);
   const char *node_excluded[] = {"hash", "lifecycle", NULL};
 
   for (size_t i = 0; i < checked_count; i++) {
@@ -9682,6 +9684,9 @@ static int context_verify_command(const Command *command) {
     }
     char *node_hash = context_json_get_string_or_null(node_json, "hash", NULL);
     char *node_id = context_json_get_string_or_null(node_json, "nodeId", NULL);
+    char *lifecycle_state = context_json_get_nested_string(node_json, "lifecycle", "state", NULL);
+    bool node_is_active = lifecycle_state && strcmp(lifecycle_state, "active") == 0;
+    free(lifecycle_state);
     char *actual_node_hash = context_hash_json_excluding(node_json, node_excluded);
     if (!node_hash || !actual_node_hash || strcmp(node_hash, actual_node_hash) != 0) {
       context_verify_append_diagnostic(&diagnostics, &diagnostic_count, "CTX-HASH", "error", node_id, "context node hash does not match canonical payload", node_file, NULL, node_hash, actual_node_hash);
@@ -9725,13 +9730,10 @@ static int context_verify_command(const Command *command) {
         } else {
           context_verify_append_diagnostic(&diagnostics, &diagnostic_count, "CTX_ANCHOR_RANGE_INVALID", "error", node_id, "source anchor range is invalid", anchor_path, NULL, NULL, "invalid range coordinates");
         }
-        if (anchor_status && strcmp(anchor_status, "active") == 0) {
-          size_t indexed_count = 0;
-          char **indexed = context_source_index_hashes(storage, anchor_path, &indexed_count);
-          if (!context_hash_list_contains(indexed, indexed_count, checked_hashes[i])) {
+        if (node_is_active && has_anchor) {
+          if (!context_hash_list_contains(all_indexed_hashes, all_indexed_count, checked_hashes[i])) {
             context_verify_append_diagnostic(&diagnostics, &diagnostic_count, "CTX-INDEX", "error", node_id, "context node is missing from source index", anchor_path, checked_hashes[i], NULL, NULL);
           }
-          context_free_hashes(indexed, indexed_count);
         }
         free(source);
       }
@@ -9791,6 +9793,7 @@ static int context_verify_command(const Command *command) {
   free(actual_root_hash);
   context_free_hashes(checked_hashes, checked_count);
   context_free_hashes(referenced_hashes, referenced_count);
+  context_free_hashes(all_indexed_hashes, all_indexed_count);
   zbuf_free(&diagnostics);
   zbuf_free(&nodes);
   free(root_snapshot_json);

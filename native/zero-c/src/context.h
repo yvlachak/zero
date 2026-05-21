@@ -17,6 +17,7 @@ bool context_json_canonicalize(ZBuf *out, const char *json);
 bool context_json_canonicalize_excluding(ZBuf *out, const char *json, const char *const *excluded_keys);
 
 char **context_source_index_hashes(const char *storage, const char *source_path, size_t *count);
+char **context_source_index_all_hashes(const char *storage, size_t *out_count);
 char *context_read_node(const char *storage, const char *hash);
 char *context_read_root_snapshot(const char *storage, const char *current_root);
 char **context_root_active_hashes(const char *root_snapshot_json, size_t *out_count);
