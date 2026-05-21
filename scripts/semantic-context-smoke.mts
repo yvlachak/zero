@@ -229,6 +229,36 @@ try {
   assert.deepEqual(fixPlanVerify.diagnostics, []);
 
   resetStorage();
+  run(["init"]);
+  const cycleBeforeRoot = readRootPointer().currentRoot;
+  const checkCycle = run(["check-cycle", "--source", source, "--json"]);
+  assert.equal(checkCycle.schemaVersion, 1);
+  assert.equal(checkCycle.mode, "context-check-cycle");
+  assert.equal(checkCycle.sourceFile, source);
+  assert.equal(checkCycle.rootTransition.previousRoot, cycleBeforeRoot);
+  assert.notEqual(checkCycle.rootTransition.currentRoot, cycleBeforeRoot);
+  assert.equal(checkCycle.rootTransition.changed, true);
+  assert.equal(checkCycle.capture.captured.length, 1);
+  assert.equal(checkCycle.capture.captured[0].nodeId, "ctx:repair-memory:typ009:make-binding-mutable");
+  assert.equal(checkCycle.capture.captured[0].action, "added");
+  assert.equal(checkCycle.capture.skipped.length, 0);
+  assert.equal(checkCycle.projection.nodes.length, 1);
+  assert.equal(checkCycle.projection.nodes[0].hash, checkCycle.capture.captured[0].hash);
+  assert.equal(checkCycle.verification.ok, true);
+  assert.equal(checkCycle.verification.checkedNodes, 1);
+  assert.deepEqual(checkCycle.verification.diagnostics, []);
+  assert.deepEqual(checkCycle.diagnostics, []);
+
+  const repeatedCycle = run(["check-cycle", "--source", source, "--json"]);
+  assert.equal(repeatedCycle.rootTransition.previousRoot, checkCycle.rootTransition.currentRoot);
+  assert.equal(repeatedCycle.rootTransition.currentRoot, checkCycle.rootTransition.currentRoot);
+  assert.equal(repeatedCycle.rootTransition.changed, false);
+  assert.equal(repeatedCycle.capture.captured.length, 1);
+  assert.equal(repeatedCycle.capture.captured[0].action, "unchanged");
+  assert.equal(repeatedCycle.projection.nodes.length, 1);
+  assert.equal(repeatedCycle.verification.ok, true);
+
+  resetStorage();
   const previewPlan = tempJson("preview-plan.json", {
     schemaVersion: 1,
     mode: "plan",

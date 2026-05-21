@@ -209,6 +209,7 @@ function usage(): never {
   semantic-context capture-fix-plan --source <file> [--fix-plan-json <path>]
   semantic-context project --source <file> --json [--include-superseded]
   semantic-context verify --json [--include-superseded]
+  semantic-context check-cycle --source <file> --json
   semantic-context diff --from <context-dir-or-root-snapshot> --to <context-dir-or-root-snapshot> --json`);
   process.exit(1);
 }
@@ -676,6 +677,10 @@ function commandCaptureRepair(sourceOption: string | boolean | undefined) {
   }, null, 2));
 }
 
+function currentRootHash() {
+  return readRootPointer()?.currentRoot ?? readRoot().contextRoot;
+}
+
 function readFixPlan(source: string, fixPlanJsonOption: string | boolean | undefined, diagnostics: Diagnostic[]): unknown | null {
   if (typeof fixPlanJsonOption === "string") {
     try {
@@ -914,10 +919,7 @@ function editsForFix(fixPlan: Record<string, unknown>, fix: { diagnosticCode: st
   return [];
 }
 
-function commandCaptureFixPlan(sourceOption: string | boolean | undefined, fixPlanJsonOption: string | boolean | undefined) {
-  if (typeof sourceOption !== "string") usage();
-  ensureLayout();
-  const source = repoRelative(sourceOption);
+function captureFixPlan(source: string, fixPlanJsonOption: string | boolean | undefined) {
   const diagnostics: Diagnostic[] = [];
   const captured: CapturedFixPlanNode[] = [];
   const skipped: SkippedFixPlanNode[] = [];
@@ -979,7 +981,7 @@ function commandCaptureFixPlan(sourceOption: string | boolean | undefined, fixPl
       });
     }
   }
-  console.log(JSON.stringify({
+  return {
     schemaVersion: 1,
     mode: "context-capture-fix-plan",
     ok: !hasError(diagnostics),
@@ -987,7 +989,16 @@ function commandCaptureFixPlan(sourceOption: string | boolean | undefined, fixPl
     captured,
     skipped,
     diagnostics,
-  }, null, 2));
+  };
+}
+
+function commandCaptureFixPlan(sourceOption: string | boolean | undefined, fixPlanJsonOption: string | boolean | undefined) {
+  if (typeof sourceOption !== "string") usage();
+  ensureLayout();
+  const source = repoRelative(sourceOption);
+  const result = captureFixPlan(source, fixPlanJsonOption);
+  console.log(JSON.stringify(result, null, 2));
+  const diagnostics = result.diagnostics;
   if (hasError(diagnostics)) process.exitCode = 1;
 }
 
@@ -1006,15 +1017,12 @@ function projectNode(node: SemanticNode) {
   };
 }
 
-function commandProject(sourceOption: string | boolean | undefined, includeSupersededOption: string | boolean | undefined) {
-  if (typeof sourceOption !== "string") usage();
-  ensureLayout();
-  const source = repoRelative(sourceOption);
+function projectSource(source: string, includeSuperseded: boolean) {
   const diagnostics: Diagnostic[] = [];
   const index = readSourceIndex();
   const root = readRoot();
   const hashes = [...(index.sources[source] ?? [])];
-  if (includeSupersededOption === true) {
+  if (includeSuperseded) {
     for (const hash of supersededNodesOf(root)) {
       const filePath = nodePath(hash);
       if (!existsSync(filePath)) continue;
@@ -1031,13 +1039,20 @@ function commandProject(sourceOption: string | boolean | undefined, includeSuper
     }
     nodes.push(projectNode(readJson<SemanticNode>(filePath)));
   }
-  console.log(JSON.stringify({
+  return {
     schemaVersion: 1,
     mode: "context-project",
     sourceFile: source,
     nodes,
     diagnostics,
-  }, null, 2));
+  };
+}
+
+function commandProject(sourceOption: string | boolean | undefined, includeSupersededOption: string | boolean | undefined) {
+  if (typeof sourceOption !== "string") usage();
+  ensureLayout();
+  const source = repoRelative(sourceOption);
+  console.log(JSON.stringify(projectSource(source, includeSupersededOption === true), null, 2));
 }
 
 function pushDiagnostic(diagnostics: Diagnostic[], diagnostic: Diagnostic) {
@@ -1125,14 +1140,13 @@ function verifyNode(node: SemanticNode, filePath: string, diagnostics: Diagnosti
   return result;
 }
 
-function commandVerify(includeSupersededOption: string | boolean | undefined) {
-  ensureLayout();
+function verifyContext(includeSuperseded: boolean) {
   const diagnostics: Diagnostic[] = [];
   const nodeResults: NodeVerification[] = [];
   const root = readRoot();
   const activeNodes = activeNodesOf(root);
   const supersededNodes = supersededNodesOf(root);
-  const checkedHashes = includeSupersededOption === true ? allRootNodes(root) : activeNodes;
+  const checkedHashes = includeSuperseded ? allRootNodes(root) : activeNodes;
   const expectedRoot = rootHash(activeNodes, supersededNodes, root.parentRoot, root.reason);
   if (root.contextRoot !== expectedRoot) {
     pushDiagnostic(diagnostics, {
@@ -1162,15 +1176,62 @@ function commandVerify(includeSupersededOption: string | boolean | undefined) {
     const hash = `sha256:${filename.slice(0, -".json".length)}`;
     if (!referencedHashes.has(hash)) pushDiagnostic(diagnostics, { code: "CTX-ORPHAN", message: "node file is not referenced by root", path: displayPath(path.join(nodesDir, filename)), hash });
   }
-  console.log(JSON.stringify({
+  return {
     schemaVersion: 1,
     mode: "context-verify",
     ok: diagnostics.length === 0,
     checkedNodes: checkedHashes.length,
     nodes: nodeResults,
     diagnostics,
-  }, null, 2));
+  };
+}
+
+function commandVerify(includeSupersededOption: string | boolean | undefined) {
+  ensureLayout();
+  const result = verifyContext(includeSupersededOption === true);
+  console.log(JSON.stringify(result, null, 2));
+  const diagnostics = result.diagnostics;
   if (diagnostics.length > 0) process.exitCode = 1;
+}
+
+function commandCheckCycle(sourceOption: string | boolean | undefined) {
+  if (typeof sourceOption !== "string") usage();
+  ensureLayout();
+  const source = repoRelative(sourceOption);
+  const previousRoot = currentRootHash();
+  const capture = captureFixPlan(source, undefined);
+  const projection = projectSource(source, false);
+  const verification = verifyContext(false);
+  const currentRoot = currentRootHash();
+  const diagnostics = [
+    ...capture.diagnostics,
+    ...projection.diagnostics,
+    ...verification.diagnostics,
+  ];
+  console.log(JSON.stringify({
+    schemaVersion: 1,
+    mode: "context-check-cycle",
+    sourceFile: source,
+    rootTransition: {
+      previousRoot,
+      currentRoot,
+      changed: previousRoot !== currentRoot,
+    },
+    capture: {
+      captured: capture.captured,
+      skipped: capture.skipped,
+    },
+    projection: {
+      nodes: projection.nodes,
+    },
+    verification: {
+      ok: verification.ok,
+      checkedNodes: verification.checkedNodes,
+      diagnostics: verification.diagnostics,
+    },
+    diagnostics,
+  }, null, 2));
+  if (hasError(diagnostics)) process.exitCode = 1;
 }
 
 function resolveContextInput(input: string) {
@@ -1414,6 +1475,7 @@ export function main(argv = process.argv.slice(2)) {
   else if (command === "capture-fix-plan") commandCaptureFixPlan(options.source, options.fixPlanJson);
   else if (command === "project") commandProject(options.source, options.includeSuperseded);
   else if (command === "verify") commandVerify(options.includeSuperseded);
+  else if (command === "check-cycle") commandCheckCycle(options.source);
   else if (command === "diff") commandDiff(options.from, options.to);
   else usage();
 }
