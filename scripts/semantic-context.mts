@@ -262,24 +262,30 @@ function configureContextDir(dir = process.env.ZERO_CONTEXT_DIR) {
 
 configureContextDir();
 
+export function usageText() {
+  return `Usage:
+  semantic-context <command> [options]
+
+Commands:
+  init
+  capture-repair
+  capture-fix-plan
+  capture-check
+  capture-explain
+  capture-graph
+  project
+  verify
+  diff
+  events
+  timeline
+  compliance
+  policy
+  reconcile
+  check-cycle`;
+}
+
 function usage(): never {
-  console.error(`Usage:
-  semantic-context init
-  semantic-context capture-repair --source <file>
-  semantic-context capture-fix-plan --source <file> [--fix-plan-json <path>]
-  semantic-context capture-check --source <file> --json
-  semantic-context capture-explain --code <diagnosticCode> --json
-  semantic-context capture-graph --source <file-or-project> --json
-  semantic-context project --source <file> --json [--include-superseded]
-  semantic-context verify --json [--include-superseded]
-  semantic-context check-cycle --source <file> --json
-  semantic-context events --json
-  semantic-context timeline [--source <file>] --json
-  semantic-context compliance [--source <file>] --json
-  semantic-context policy [--source <file>] [--policy advisory|verified|strict] --json
-  semantic-context reconcile --source <file> --json
-  semantic-context reconcile --node <hash> --action archive|refresh-anchor|supersede [--summary <text>] --json
-  semantic-context diff --from <context-dir-or-root-snapshot> --to <context-dir-or-root-snapshot> --json`);
+  console.error(usageText());
   process.exit(1);
 }
 

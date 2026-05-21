@@ -12,7 +12,7 @@ const fixtureDir = path.join("/tmp", `zero-semantic-context-fixtures-${process.p
 const source = "conformance/native/fail/mem-copy-immutable-dst.0";
 
 process.env.ZERO_CONTEXT_DIR = storage;
-const { canonicalize, main, nodeHash, rootHashForSourceIndex } = await import("./semantic-context.mts");
+const { canonicalize, main, nodeHash, rootHashForSourceIndex, usageText } = await import("./semantic-context.mts");
 
 function run(args: string[], options: { allowFailure?: boolean; storage?: string } = {}): any {
   const originalLog = console.log;
@@ -112,6 +112,12 @@ function mutateResidualSummary(dir: string, summary: string) {
 
 try {
   resetStorage();
+
+  const usage = usageText();
+  assert(usage.includes("semantic-context <command> [options]"));
+  for (const command of ["init", "capture-repair", "capture-fix-plan", "capture-check", "capture-explain", "capture-graph", "project", "verify", "diff", "events", "timeline", "compliance", "policy", "reconcile", "check-cycle"]) {
+    assert(usage.includes(command));
+  }
 
   const init = run(["init"]);
   assert.equal(init.schemaVersion, 1);
