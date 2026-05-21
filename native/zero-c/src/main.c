@@ -9276,6 +9276,11 @@ static int context_project_command(const Command *command) {
   }
 
   char *root_file = join_cli_path(storage, "root.json");
+  if (!path_exists(root_file)) {
+    append_context_project_empty_json(source, "CTX_ROOT_POINTER_MISSING", "semantic context root pointer does not exist", root_file);
+    free(root_file);
+    return 0;
+  }
   ZDiag read_diag = {0};
   char *root_json = z_read_file(root_file, &read_diag);
   char *current_root = root_json ? context_json_get_string_or_null(root_json, "currentRoot", NULL) : NULL;
@@ -9285,6 +9290,20 @@ static int context_project_command(const Command *command) {
     free(root_json);
     return 0;
   }
+
+  char *indexes_dir = join_cli_path(storage, "indexes");
+  char *source_index_path = join_cli_path(indexes_dir, "source-index.json");
+  if (!path_exists(source_index_path)) {
+    append_context_project_empty_json(source, "CTX_SOURCE_INDEX_MISSING", "semantic context source index does not exist", source_index_path);
+    free(source_index_path);
+    free(indexes_dir);
+    free(current_root);
+    free(root_json);
+    free(root_file);
+    return 0;
+  }
+  free(source_index_path);
+  free(indexes_dir);
 
   size_t hash_count = 0;
   char **hashes = context_source_index_hashes(storage, source, &hash_count);

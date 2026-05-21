@@ -349,6 +349,57 @@ for (const [command, expected] of [
 }
 
 {
+  const ctxDir = join(outDir, "context-project-no-source-fixture");
+  rmSync(ctxDir, { recursive: true, force: true });
+  mkdirSync(ctxDir, { recursive: true });
+  try {
+    const result = json(["context", "project", "--json"], { env: { ZERO_CONTEXT_DIR: ctxDir } });
+    assert.equal(result.body.schemaVersion, 1);
+    assert.equal(result.body.mode, "context-project");
+    assert.equal(result.body.sourceFile, null);
+    assert.deepEqual(result.body.nodes, []);
+    assert.equal(result.body.diagnostics[0].code, "CTX_CONTEXT_SOURCE_MISSING");
+    assert.equal(result.code, 0);
+  } finally {
+    rmSync(ctxDir, { recursive: true, force: true });
+  }
+}
+
+{
+  const ctxDir = join(outDir, "context-project-root-missing-fixture");
+  rmSync(ctxDir, { recursive: true, force: true });
+  mkdirSync(ctxDir, { recursive: true });
+  try {
+    const result = json(["context", "project", "--source", "foo.0", "--json"], { env: { ZERO_CONTEXT_DIR: ctxDir } });
+    assert.equal(result.body.diagnostics[0].code, "CTX_ROOT_POINTER_MISSING");
+    assert.equal(result.code, 0);
+  } finally {
+    rmSync(ctxDir, { recursive: true, force: true });
+  }
+}
+
+{
+  const ctxDir = join(outDir, "context-project-index-missing-fixture");
+  const rootHash = "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+  rmSync(ctxDir, { recursive: true, force: true });
+  mkdirSync(join(ctxDir, "roots"), { recursive: true });
+  writeFileSync(join(ctxDir, "root.json"), JSON.stringify({
+    schemaVersion: 1,
+    currentRoot: rootHash,
+    previousRoot: null,
+    rootPath: join(ctxDir, "roots", `${rootHash.replace("sha256:", "")}.json`),
+    indexes: { sourceIndex: join(ctxDir, "indexes", "source-index.json") },
+  }, null, 2));
+  try {
+    const result = json(["context", "project", "--source", "foo.0", "--json"], { env: { ZERO_CONTEXT_DIR: ctxDir } });
+    assert.equal(result.body.diagnostics[0].code, "CTX_SOURCE_INDEX_MISSING");
+    assert.equal(result.code, 0);
+  } finally {
+    rmSync(ctxDir, { recursive: true, force: true });
+  }
+}
+
+{
   const ctxDir = join(outDir, "context-project-fixture");
   const sourceFile = "conformance/native/fail/mem-copy-immutable-dst.0";
   const rootHash = "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
