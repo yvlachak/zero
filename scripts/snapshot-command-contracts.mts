@@ -237,6 +237,7 @@ for (const [command, expected] of [
   [["explain", "--help"], /Usage: zero explain/],
   [["fix", "--help"], /Usage: zero fix/],
   [["context", "--help"], /Usage: zero context/],
+  [["context", "project", "--help"], /Usage: zero context/],
 ] as Array<[string[], RegExp]>) {
   assert.match(zero(command).stdout, expected);
 }
@@ -317,6 +318,115 @@ for (const [command, expected] of [
     assert.equal(result.body.sourceIndexPath, sourceIndexFile);
     assert.equal(result.body.sourceIndexExists, true);
     assert.equal(result.body.nativeContextSupport, "experimental");
+    assert.deepEqual(result.body.diagnostics, []);
+    assert.equal(result.code, 0);
+
+    const emptyProject = json(["context", "project", "--source", "foo.0", "--json"], { env: { ZERO_CONTEXT_DIR: ctxDir } });
+    assert.equal(emptyProject.body.schemaVersion, 1);
+    assert.equal(emptyProject.body.mode, "context-project");
+    assert.equal(emptyProject.body.sourceFile, "foo.0");
+    assert.deepEqual(emptyProject.body.nodes, []);
+    assert.deepEqual(emptyProject.body.diagnostics, []);
+    assert.equal(emptyProject.code, 0);
+  } finally {
+    rmSync(ctxDir, { recursive: true, force: true });
+  }
+}
+
+{
+  const tmpDir = mkdtempSync(join(tmpdir(), "zero-ctx-project-missing-"));
+  try {
+    const result = json(["context", "project", "--source", "foo.0", "--json"], { env: { ZERO_CONTEXT_DIR: join(tmpDir, "nonexistent") } });
+    assert.equal(result.body.schemaVersion, 1);
+    assert.equal(result.body.mode, "context-project");
+    assert.equal(result.body.sourceFile, null);
+    assert.deepEqual(result.body.nodes, []);
+    assert.equal(result.body.diagnostics[0].code, "CTX_CONTEXT_STORAGE_MISSING");
+    assert.equal(result.code, 0);
+  } finally {
+    rmSync(tmpDir, { recursive: true, force: true });
+  }
+}
+
+{
+  const ctxDir = join(outDir, "context-project-fixture");
+  const sourceFile = "conformance/native/fail/mem-copy-immutable-dst.0";
+  const rootHash = "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+  const nodeHash = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+  const rootFile = join(ctxDir, "root.json");
+  const rootSnapshotFile = join(ctxDir, "roots", `${rootHash.replace("sha256:", "")}.json`);
+  const sourceIndexFile = join(ctxDir, "indexes", "source-index.json");
+  const nodeFile = join(ctxDir, "nodes", `${nodeHash.replace("sha256:", "")}.json`);
+  rmSync(ctxDir, { recursive: true, force: true });
+  mkdirSync(join(ctxDir, "roots"), { recursive: true });
+  mkdirSync(join(ctxDir, "indexes"), { recursive: true });
+  mkdirSync(join(ctxDir, "nodes"), { recursive: true });
+  writeFileSync(rootFile, `${JSON.stringify({
+    schemaVersion: 1,
+    currentRoot: rootHash,
+    previousRoot: null,
+    rootPath: rootSnapshotFile,
+    indexes: {
+      sourceIndex: sourceIndexFile,
+    },
+  }, null, 2)}\n`);
+  writeFileSync(rootSnapshotFile, `${JSON.stringify({
+    schemaVersion: 1,
+    contextRoot: rootHash,
+    parentRoot: null,
+    reason: "capture-fix-plan",
+    activeNodes: [nodeHash],
+    supersededNodes: [],
+    archivedNodes: [],
+    nodes: [nodeHash],
+    createdAt: null,
+    indexes: {
+      sourceIndex: sourceIndexFile,
+    },
+  }, null, 2)}\n`);
+  writeFileSync(sourceIndexFile, `${JSON.stringify({ schemaVersion: 1, sources: { [sourceFile]: [nodeHash] } }, null, 2)}\n`);
+  writeFileSync(nodeFile, `${JSON.stringify({
+    schemaVersion: 1,
+    kind: "repair-memory",
+    nodeId: "ctx:repair-memory:typ009:make-binding-mutable",
+    hash: nodeHash,
+    lifecycle: {
+      state: "active",
+      supersedes: [],
+      supersededBy: null,
+    },
+    parents: [],
+    codes: ["DIAGNOSTIC_REPAIR", "MUTABLE_BINDING_REQUIRED"],
+    diagnosticCode: "TYP009",
+    repairId: "make-binding-mutable",
+    sourceAnchor: {
+      path: sourceFile,
+      range: { startLine: 2, startCol: 6, endLine: 2, endCol: 9 },
+      sourceHash: "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      status: "active",
+    },
+    residualSummary: "Make the binding mutable before passing it to mutable memory APIs.",
+    projection: {
+      kind: "context-projection",
+      frontier: {
+        diagnostics: ["TYP009"],
+        repairs: ["make-binding-mutable"],
+        edits: [{ path: sourceFile, precondition: "let", replacement: "let mut" }],
+      },
+    },
+  }, null, 2)}\n`);
+  try {
+    const result = json(["context", "project", "--source", sourceFile, "--json"], { env: { ZERO_CONTEXT_DIR: ctxDir } });
+    assert.equal(result.body.schemaVersion, 1);
+    assert.equal(result.body.mode, "context-project");
+    assert.equal(result.body.sourceFile, sourceFile);
+    assert.equal(result.body.nodes.length, 1);
+    assert.equal(result.body.nodes[0].kind, "repair-memory");
+    assert.equal(result.body.nodes[0].nodeId, "ctx:repair-memory:typ009:make-binding-mutable");
+    assert.equal(result.body.nodes[0].hash, nodeHash);
+    assert.equal(result.body.nodes[0].lifecycle.state, "active");
+    assert.equal(result.body.nodes[0].frontier.repairs[0], "make-binding-mutable");
+    assert.equal(result.body.nodes[0].projection, undefined);
     assert.deepEqual(result.body.diagnostics, []);
     assert.equal(result.code, 0);
   } finally {

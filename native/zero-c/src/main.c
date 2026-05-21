@@ -2,6 +2,7 @@
 #define _POSIX_C_SOURCE 200809L
 #endif
 
+#include "context.h"
 #include "zero.h"
 
 #include <ctype.h>
@@ -35,6 +36,7 @@ typedef enum {
 typedef struct {
   const char *command;
   const char *kind;
+  const char *source;
   const char *input;
   const char *out;
   const char *target;
@@ -76,6 +78,7 @@ typedef struct {
 
 static void print_command_help(const char *command);
 static int context_status_command(const Command *command);
+static int context_project_command(const Command *command);
 
 static const char *diag_code(int code) {
   switch (code) {
@@ -663,11 +666,6 @@ static bool path_exists(const char *path) {
 static bool dir_exists(const char *path) {
   struct stat st;
   return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
-}
-
-static const char *context_storage_dir(void) {
-  const char *override = getenv("ZERO_CONTEXT_DIR");
-  return override && override[0] ? override : ".zero/context";
 }
 
 static int zero_mkdir(const char *path) {
@@ -3454,6 +3452,7 @@ static void print_command_help(const char *command) {
     printf("Usage: zero context <subcommand> [--json]\n\n");
     printf("Subcommands:\n");
     printf("  status    Report semantic context storage status\n");
+    printf("  project   Project active semantic context for a source\n");
     printf("  help      Show this help\n");
   } else if (strcmp(command, "version") == 0 || strcmp(command, "--version") == 0) {
     printf("Usage: zero --version [--json]\n\n");
@@ -3572,6 +3571,10 @@ static bool parse_command(int argc, char **argv, Command *command) {
     for (int i = 2; i < argc; i++) {
       if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) command->kind = "help";
       else if (strcmp(argv[i], "--json") == 0) command->json = true;
+      else if (strcmp(argv[i], "--source") == 0) {
+        if (i + 1 >= argc) command->unknown_flag = argv[i];
+        else command->source = argv[++i];
+      }
       else if (strcmp(argv[i], "help") == 0) command->kind = "help";
       else if (!command->kind || strcmp(command->kind, "status") == 0) command->kind = argv[i];
       else command->unknown_flag = argv[i];
@@ -9011,79 +9014,6 @@ static void append_graph_json(ZBuf *buf, const SourceInput *input, const Program
   zbuf_append(buf, "\n}\n");
 }
 
-static const char *context_json_skip_ws(const char *cursor) {
-  while (cursor && (*cursor == ' ' || *cursor == '\n' || *cursor == '\r' || *cursor == '\t')) cursor++;
-  return cursor;
-}
-
-static const char *context_json_member_value(const char *json, const char *name) {
-  if (!json || !name) return NULL;
-  char key[128];
-  snprintf(key, sizeof(key), "\"%s\"", name);
-  const char *cursor = strstr(json, key);
-  if (!cursor) return NULL;
-  cursor += strlen(key);
-  cursor = context_json_skip_ws(cursor);
-  if (!cursor || *cursor != ':') return NULL;
-  return context_json_skip_ws(cursor + 1);
-}
-
-static bool context_json_get_int(const char *json, const char *name, int *out) {
-  const char *cursor = context_json_member_value(json, name);
-  if (!cursor || !isdigit((unsigned char)*cursor)) return false;
-  char *end = NULL;
-  long value = strtol(cursor, &end, 10);
-  if (!end || end == cursor) return false;
-  *out = (int)value;
-  return true;
-}
-
-static char *context_json_get_string_or_null(const char *json, const char *name, bool *is_null) {
-  if (is_null) *is_null = false;
-  const char *cursor = context_json_member_value(json, name);
-  if (!cursor) return NULL;
-  if (strncmp(cursor, "null", 4) == 0) {
-    if (is_null) *is_null = true;
-    return NULL;
-  }
-  if (*cursor != '"') return NULL;
-  cursor++;
-  ZBuf value;
-  zbuf_init(&value);
-  while (*cursor) {
-    if (*cursor == '"') return value.data ? value.data : z_strdup("");
-    if (*cursor == '\\' && cursor[1]) {
-      cursor++;
-      if (*cursor == 'n') zbuf_append_char(&value, '\n');
-      else if (*cursor == 'r') zbuf_append_char(&value, '\r');
-      else if (*cursor == 't') zbuf_append_char(&value, '\t');
-      else zbuf_append_char(&value, *cursor);
-      cursor++;
-      continue;
-    }
-    zbuf_append_char(&value, *cursor++);
-  }
-  zbuf_free(&value);
-  return NULL;
-}
-
-static char *context_root_snapshot_path(const char *storage, const char *current_root) {
-  if (!storage || !current_root) return NULL;
-  const char *hash = strncmp(current_root, "sha256:", 7) == 0 ? current_root + 7 : current_root;
-  char *roots = join_cli_path(storage, "roots");
-  char *file = NULL;
-  if (roots) {
-    ZBuf filename;
-    zbuf_init(&filename);
-    zbuf_append(&filename, hash);
-    zbuf_append(&filename, ".json");
-    file = join_cli_path(roots, filename.data);
-    zbuf_free(&filename);
-  }
-  free(roots);
-  return file;
-}
-
 static void append_context_status_json(
   ZBuf *buf,
   const char *storage,
@@ -9240,6 +9170,174 @@ static int context_status_command(const Command *command) {
   return 0;
 }
 
+static void append_context_project_storage_missing_json(const char *storage) {
+  printf("{\n");
+  printf("  \"schemaVersion\": 1,\n");
+  printf("  \"mode\": \"context-project\",\n");
+  printf("  \"sourceFile\": null,\n");
+  printf("  \"nodes\": [],\n");
+  printf("  \"diagnostics\": [\n");
+  printf("    {\"code\": \"CTX_CONTEXT_STORAGE_MISSING\", \"severity\": \"warning\", \"message\": \"semantic context storage does not exist\", \"path\": ");
+  print_json_string(storage);
+  printf("}\n");
+  printf("  ]\n");
+  printf("}\n");
+}
+
+static void append_context_project_empty_json(const char *source, const char *diagnostic_code, const char *diagnostic_message, const char *diagnostic_path) {
+  printf("{\n  \"schemaVersion\": 1,\n  \"mode\": \"context-project\",\n  \"sourceFile\": ");
+  if (source) print_json_string(source);
+  else printf("null");
+  printf(",\n  \"nodes\": [],\n  \"diagnostics\": ");
+  if (diagnostic_code) {
+    printf("[\n    {\"code\": ");
+    print_json_string(diagnostic_code);
+    printf(", \"severity\": \"warning\", \"message\": ");
+    print_json_string(diagnostic_message);
+    printf(", \"path\": ");
+    print_json_string(diagnostic_path);
+    printf("}\n  ]");
+  } else {
+    printf("[]");
+  }
+  printf("\n}\n");
+}
+
+static void append_context_project_string_field(ZBuf *buf, const char *json, const char *output_name, const char *input_name) {
+  char *value = context_json_get_string_or_null(json, input_name, NULL);
+  zbuf_append(buf, ",\n      ");
+  append_json_string(buf, output_name);
+  zbuf_append(buf, ": ");
+  if (value) append_json_string(buf, value);
+  else zbuf_append(buf, "null");
+  free(value);
+}
+
+static void append_context_project_raw_field(ZBuf *buf, const char *json, const char *output_name, const char *input_name) {
+  zbuf_append(buf, ",\n      ");
+  append_json_string(buf, output_name);
+  zbuf_append(buf, ": ");
+  if (!context_json_emit_field(buf, json, input_name)) zbuf_append(buf, "null");
+}
+
+static void append_context_project_frontier(ZBuf *buf, const char *node_json) {
+  ZBuf projection;
+  zbuf_init(&projection);
+  zbuf_append(buf, ",\n      \"frontier\": ");
+  if (context_json_emit_field(&projection, node_json, "projection")) {
+    if (!context_json_emit_field(buf, projection.data, "frontier")) zbuf_append(buf, "null");
+  } else {
+    zbuf_append(buf, "null");
+  }
+  zbuf_free(&projection);
+}
+
+static void append_context_project_node(ZBuf *buf, const char *node_json, const char *fallback_hash) {
+  char *kind = context_json_get_string_or_null(node_json, "kind", NULL);
+  char *node_id = context_json_get_string_or_null(node_json, "nodeId", NULL);
+  char *hash = context_json_get_string_or_null(node_json, "hash", NULL);
+  zbuf_append(buf, "    {\n      \"kind\": ");
+  append_json_string_or_null(buf, kind);
+  zbuf_append(buf, ",\n      \"nodeId\": ");
+  append_json_string_or_null(buf, node_id);
+  zbuf_append(buf, ",\n      \"hash\": ");
+  append_json_string_or_null(buf, hash ? hash : fallback_hash);
+  append_context_project_raw_field(buf, node_json, "lifecycle", "lifecycle");
+  append_context_project_raw_field(buf, node_json, "parents", "parents");
+  append_context_project_raw_field(buf, node_json, "codes", "codes");
+  append_context_project_string_field(buf, node_json, "diagnosticCode", "diagnosticCode");
+  append_context_project_string_field(buf, node_json, "repairId", "repairId");
+  append_context_project_string_field(buf, node_json, "severity", "severity");
+  append_context_project_string_field(buf, node_json, "message", "message");
+  append_context_project_string_field(buf, node_json, "expected", "expected");
+  append_context_project_string_field(buf, node_json, "actual", "actual");
+  append_context_project_string_field(buf, node_json, "help", "help");
+  append_context_project_raw_field(buf, node_json, "sourceAnchor", "sourceAnchor");
+  append_context_project_raw_field(buf, node_json, "explain", "explain");
+  append_context_project_raw_field(buf, node_json, "graph", "graph");
+  append_context_project_string_field(buf, node_json, "residualSummary", "residualSummary");
+  append_context_project_frontier(buf, node_json);
+  zbuf_append(buf, "\n    }");
+  free(kind);
+  free(node_id);
+  free(hash);
+}
+
+static int context_project_command(const Command *command) {
+  const char *storage = context_storage_dir();
+  const char *source = command ? command->source : NULL;
+  if (!dir_exists(storage)) {
+    append_context_project_storage_missing_json(storage);
+    return 0;
+  }
+  if (!source || !source[0]) {
+    append_context_project_empty_json(NULL, "CTX_CONTEXT_SOURCE_MISSING", "context project requires --source", storage);
+    return 0;
+  }
+
+  char *root_file = join_cli_path(storage, "root.json");
+  ZDiag read_diag = {0};
+  char *root_json = z_read_file(root_file, &read_diag);
+  char *current_root = root_json ? context_json_get_string_or_null(root_json, "currentRoot", NULL) : NULL;
+  if (!current_root) {
+    append_context_project_empty_json(source, "CTX_ROOT_POINTER_MALFORMED", "semantic context root pointer is malformed", root_file);
+    free(root_file);
+    free(root_json);
+    return 0;
+  }
+
+  size_t hash_count = 0;
+  char **hashes = context_source_index_hashes(storage, source, &hash_count);
+  ZBuf out;
+  zbuf_init(&out);
+  zbuf_append(&out, "{\n  \"schemaVersion\": 1,\n  \"mode\": \"context-project\",\n  \"sourceFile\": ");
+  append_json_string(&out, source);
+  zbuf_append(&out, ",\n  \"nodes\": [\n");
+  ZBuf diagnostics;
+  zbuf_init(&diagnostics);
+  size_t emitted_nodes = 0;
+  size_t diagnostic_count = 0;
+  for (size_t i = 0; i < hash_count; i++) {
+    char *node_json = context_read_node(storage, hashes[i]);
+    if (!node_json) {
+      if (diagnostic_count++ > 0) zbuf_append(&diagnostics, ",\n");
+      zbuf_append(&diagnostics, "    {\"code\": \"CTX001\", \"message\": \"indexed context node is missing\", \"path\": ");
+      append_json_string(&diagnostics, source);
+      zbuf_append(&diagnostics, ", \"hash\": ");
+      append_json_string(&diagnostics, hashes[i]);
+      zbuf_append(&diagnostics, "}");
+      continue;
+    }
+    char *state = context_json_get_nested_string(node_json, "lifecycle", "state", NULL);
+    bool active = state && strcmp(state, "active") == 0;
+    free(state);
+    if (active) {
+      if (emitted_nodes++ > 0) zbuf_append(&out, ",\n");
+      append_context_project_node(&out, node_json, hashes[i]);
+    }
+    free(node_json);
+  }
+  zbuf_append(&out, "\n  ],\n  \"diagnostics\": ");
+  if (diagnostic_count > 0) {
+    zbuf_append(&out, "[\n");
+    zbuf_append(&out, diagnostics.data ? diagnostics.data : "");
+    zbuf_append(&out, "\n  ]");
+  } else {
+    zbuf_append(&out, "[]");
+  }
+  zbuf_append(&out, "\n}\n");
+  fputs(out.data, stdout);
+
+  for (size_t i = 0; i < hash_count; i++) free(hashes[i]);
+  free(hashes);
+  free(current_root);
+  free(root_json);
+  free(root_file);
+  zbuf_free(&diagnostics);
+  zbuf_free(&out);
+  return 0;
+}
+
 int main(int argc, char **argv) {
   if (argc >= 2 && (strcmp(argv[1], "--help") == 0 || strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "help") == 0)) {
     print_help();
@@ -9305,6 +9403,9 @@ int main(int argc, char **argv) {
     }
     if (command.kind && strcmp(command.kind, "status") == 0) {
       return context_status_command(&command);
+    }
+    if (command.kind && strcmp(command.kind, "project") == 0) {
+      return context_project_command(&command);
     }
     print_command_help("context");
     return 1;
