@@ -3,8 +3,10 @@
 #endif
 
 #include "context.h"
+#include "hash.h"
 
 #include <ctype.h>
+#include <dirent.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
@@ -146,6 +148,11 @@ const char *context_storage_dir(void) {
   return override && override[0] ? override : ".zero/context";
 }
 
+char *context_root_pointer_path(const char *storage) {
+  if (!storage) return NULL;
+  return context_join_path(storage, "root.json");
+}
+
 char *context_root_snapshot_path(const char *storage, const char *current_root) {
   if (!storage || !current_root) return NULL;
   const char *hash = strncmp(current_root, "sha256:", 7) == 0 ? current_root + 7 : current_root;
@@ -160,6 +167,34 @@ char *context_root_snapshot_path(const char *storage, const char *current_root) 
     zbuf_free(&filename);
   }
   free(roots);
+  return file;
+}
+
+char *context_node_path(const char *storage, const char *hash) {
+  if (!storage || !hash) return NULL;
+  const char *bare_hash = strncmp(hash, "sha256:", 7) == 0 ? hash + 7 : hash;
+  char *nodes = context_join_path(storage, "nodes");
+  ZBuf filename;
+  zbuf_init(&filename);
+  zbuf_append(&filename, bare_hash);
+  zbuf_append(&filename, ".json");
+  char *file = context_join_path(nodes, filename.data);
+  free(nodes);
+  zbuf_free(&filename);
+  return file;
+}
+
+char *context_event_path(const char *storage, const char *event_hash) {
+  if (!storage || !event_hash) return NULL;
+  const char *bare_hash = strncmp(event_hash, "sha256:", 7) == 0 ? event_hash + 7 : event_hash;
+  char *events = context_join_path(storage, "events");
+  ZBuf filename;
+  zbuf_init(&filename);
+  zbuf_append(&filename, bare_hash);
+  zbuf_append(&filename, ".json");
+  char *file = context_join_path(events, filename.data);
+  free(events);
+  zbuf_free(&filename);
   return file;
 }
 
@@ -416,6 +451,36 @@ bool context_json_canonicalize(ZBuf *out, const char *json) {
   return context_json_canonicalize_excluding(out, json, NULL);
 }
 
+static char *context_prefixed_sha256(const char *data, size_t len) {
+  unsigned char digest[Z_SHA256_DIGEST_LEN];
+  char hex[65];
+  z_sha256_hash((const unsigned char *)data, len, digest);
+  z_sha256_hex(digest, hex);
+  ZBuf out;
+  zbuf_init(&out);
+  zbuf_append(&out, "sha256:");
+  zbuf_append(&out, hex);
+  return out.data;
+}
+
+char *context_event_hash(const char *event_json) {
+  const char *excluded[] = {"eventHash", NULL};
+  ZBuf canonical;
+  zbuf_init(&canonical);
+  if (!context_json_canonicalize_excluding(&canonical, event_json, excluded)) {
+    zbuf_free(&canonical);
+    return NULL;
+  }
+  char *hash = context_prefixed_sha256(canonical.data, canonical.len);
+  zbuf_free(&canonical);
+  return hash;
+}
+
+char *context_node_lifecycle_state(const char *node_json) {
+  char *state = context_json_get_nested_string(node_json, "lifecycle", "state", NULL);
+  return state ? state : z_strdup("active");
+}
+
 char **context_source_index_hashes(const char *storage, const char *source_path, size_t *count) {
   if (count) *count = 0;
   if (!storage || !source_path || !count) return NULL;
@@ -526,19 +591,37 @@ char **context_source_index_all_hashes(const char *storage, size_t *out_count) {
   return hashes;
 }
 
+char **context_event_filenames(const char *storage, size_t *out_count) {
+  if (out_count) *out_count = 0;
+  if (!storage || !out_count) return NULL;
+  char *events = context_join_path(storage, "events");
+  DIR *dir = opendir(events);
+  free(events);
+  if (!dir) return NULL;
+  char **filenames = NULL;
+  size_t count = 0;
+  size_t cap = 0;
+  struct dirent *entry = NULL;
+  while ((entry = readdir(dir)) != NULL) {
+    size_t len = strlen(entry->d_name);
+    if (len <= 5 || strcmp(entry->d_name + len - 5, ".json") != 0) continue;
+    if (count == cap) {
+      cap = cap ? cap * 2 : 8;
+      filenames = z_checked_reallocarray(filenames, cap, sizeof(char *));
+    }
+    filenames[count++] = z_strdup(entry->d_name);
+  }
+  closedir(dir);
+  if (count > 1) qsort(filenames, count, sizeof(char *), context_string_cmp);
+  *out_count = count;
+  return filenames;
+}
+
 char *context_read_node(const char *storage, const char *hash) {
-  if (!storage || !hash) return NULL;
-  const char *bare_hash = strncmp(hash, "sha256:", 7) == 0 ? hash + 7 : hash;
-  char *nodes = context_join_path(storage, "nodes");
-  ZBuf filename;
-  zbuf_init(&filename);
-  zbuf_append(&filename, bare_hash);
-  zbuf_append(&filename, ".json");
-  char *node_file = context_join_path(nodes, filename.data);
+  char *node_file = context_node_path(storage, hash);
+  if (!node_file) return NULL;
   ZDiag diag = {0};
   char *json = z_read_file(node_file, &diag);
-  free(nodes);
-  zbuf_free(&filename);
   free(node_file);
   return json;
 }
@@ -669,4 +752,91 @@ char **context_root_all_hashes(const char *root_snapshot_json, size_t *out_count
   }
   if (out_count) *out_count = write;
   return items;
+}
+
+static char **context_root_hash_array_field(const char *root_snapshot_json, const char *field, size_t *out_count, bool *present) {
+  if (out_count) *out_count = 0;
+  if (present) *present = false;
+  ZBuf raw;
+  zbuf_init(&raw);
+  if (!context_json_emit_field(&raw, root_snapshot_json, field)) {
+    zbuf_free(&raw);
+    return NULL;
+  }
+  if (present) *present = true;
+  char **hashes = context_json_string_array(raw.data, out_count);
+  zbuf_free(&raw);
+  return hashes;
+}
+
+static void context_append_string_array(ZBuf *out, char **items, size_t count) {
+  zbuf_append_char(out, '[');
+  for (size_t i = 0; i < count; i++) {
+    if (i > 0) zbuf_append_char(out, ',');
+    context_json_append_escaped_string(out, items[i]);
+  }
+  zbuf_append_char(out, ']');
+}
+
+static void context_free_string_array(char **items, size_t count) {
+  for (size_t i = 0; i < count; i++) free(items[i]);
+  free(items);
+}
+
+char *context_root_payload_hash(const char *root_snapshot_json) {
+  if (!root_snapshot_json) return NULL;
+  bool active_present = false;
+  size_t active_count = 0;
+  char **active = context_root_hash_array_field(root_snapshot_json, "activeNodes", &active_count, &active_present);
+  if (!active_present) active = context_root_hash_array_field(root_snapshot_json, "nodes", &active_count, NULL);
+
+  size_t superseded_count = 0;
+  char **superseded = context_root_hash_array_field(root_snapshot_json, "supersededNodes", &superseded_count, NULL);
+  size_t archived_count = 0;
+  char **archived = context_root_hash_array_field(root_snapshot_json, "archivedNodes", &archived_count, NULL);
+
+  bool parent_is_null = false;
+  char *parent_root = context_json_get_string_or_null(root_snapshot_json, "parentRoot", &parent_is_null);
+  char *reason = context_json_get_string_or_null(root_snapshot_json, "reason", NULL);
+  if (!reason) reason = z_strdup("manual");
+  char *source_index = context_json_get_nested_string(root_snapshot_json, "indexes", "sourceIndex", NULL);
+  if (!source_index) source_index = z_strdup(".zero/context/indexes/source-index.json");
+
+  ZBuf payload;
+  zbuf_init(&payload);
+  zbuf_append(&payload, "{");
+  zbuf_append(&payload, "\"schemaVersion\":1,");
+  zbuf_append(&payload, "\"parentRoot\":");
+  if (parent_root) context_json_append_escaped_string(&payload, parent_root);
+  else zbuf_append(&payload, "null");
+  zbuf_append(&payload, ",\"reason\":");
+  context_json_append_escaped_string(&payload, reason);
+  zbuf_append(&payload, ",\"activeNodes\":");
+  context_append_string_array(&payload, active, active_count);
+  zbuf_append(&payload, ",\"nodes\":");
+  context_append_string_array(&payload, active, active_count);
+  zbuf_append(&payload, ",\"supersededNodes\":");
+  context_append_string_array(&payload, superseded, superseded_count);
+  zbuf_append(&payload, ",\"archivedNodes\":");
+  context_append_string_array(&payload, archived, archived_count);
+  zbuf_append(&payload, ",\"createdAt\":null,\"indexes\":{\"sourceIndex\":");
+  context_json_append_escaped_string(&payload, source_index);
+  zbuf_append(&payload, "}}");
+
+  ZBuf canonical;
+  zbuf_init(&canonical);
+  char *hash = NULL;
+  if (context_json_canonicalize(&canonical, payload.data)) {
+    hash = context_prefixed_sha256(canonical.data, canonical.len);
+  }
+  zbuf_free(&canonical);
+  zbuf_free(&payload);
+  context_free_string_array(active, active_count);
+  context_free_string_array(superseded, superseded_count);
+  context_free_string_array(archived, archived_count);
+  free(parent_root);
+  free(reason);
+  free(source_index);
+  (void)parent_is_null;
+  return hash;
 }
