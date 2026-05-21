@@ -533,6 +533,105 @@ try {
     for (const dir of [missingRootDir, tamperedEventDir, tamperedNodeDir, staleIndexDir, strictCycleDir, verifiedCycleDir]) resetStorage(dir);
   }
 
+  const reconcileHappyDir = path.join("/tmp", `zero-semantic-context-reconcile-happy-${process.pid}`);
+  const reconcileMismatchDir = path.join("/tmp", `zero-semantic-context-reconcile-mismatch-${process.pid}`);
+  const reconcileArchiveDir = path.join("/tmp", `zero-semantic-context-reconcile-archive-${process.pid}`);
+  const reconcileRefreshDir = path.join("/tmp", `zero-semantic-context-reconcile-refresh-${process.pid}`);
+  const reconcileSupersedeDir = path.join("/tmp", `zero-semantic-context-reconcile-supersede-${process.pid}`);
+  try {
+    resetStorage(reconcileHappyDir);
+    run(["init"], { storage: reconcileHappyDir });
+    run(["check-cycle", "--source", source, "--json"], { storage: reconcileHappyDir });
+    const happyReconcile = run(["reconcile", "--source", source, "--json"], { storage: reconcileHappyDir });
+    assert.equal(happyReconcile.mode, "context-reconcile");
+    assert.equal(happyReconcile.ok, true);
+    assert.deepEqual(happyReconcile.actions, []);
+    assert.deepEqual(happyReconcile.diagnostics, []);
+
+    resetStorage(reconcileMismatchDir);
+    const reconcileMismatchSource = tempFixture("reconcile-mismatch.0");
+    const reconcileMismatchCapture = run(["capture-repair", "--source", reconcileMismatchSource], { storage: reconcileMismatchDir });
+    let reconcileMismatchText = readFileSync(reconcileMismatchSource, "utf8");
+    reconcileMismatchText = reconcileMismatchText.replace(/\blet\b/g, "var");
+    writeFileSync(reconcileMismatchSource, reconcileMismatchText);
+    const mismatchReconcile = run(["reconcile", "--source", reconcileMismatchSource, "--json"], { storage: reconcileMismatchDir, allowFailure: true });
+    assert.equal(mismatchReconcile.ok, false);
+    assert(mismatchReconcile.actions.some((action: any) =>
+      action.hash === reconcileMismatchCapture.node.hash &&
+      action.action === "refresh-anchor"
+    ));
+    assert(mismatchReconcile.diagnostics.some((diagnostic: any) =>
+      diagnostic.code === "CTX_RECONCILE_SOURCE_VERIFY_FAILED" &&
+      diagnostic.severity === "error"
+    ));
+
+    resetStorage(reconcileArchiveDir);
+    const archiveCapture = run(["capture-repair", "--source", source], { storage: reconcileArchiveDir });
+    const archiveBeforeRoot = readRootPointer(reconcileArchiveDir).currentRoot;
+    const archiveReconcile = run(["reconcile", "--node", archiveCapture.node.hash, "--action", "archive", "--json"], { storage: reconcileArchiveDir });
+    assert.equal(archiveReconcile.ok, true);
+    assert.equal(archiveReconcile.action, "archive");
+    assert.equal(archiveReconcile.node.lifecycle.state, "archived");
+    assert.notEqual(archiveReconcile.rootTransition.currentRoot, archiveBeforeRoot);
+    const archiveProject = run(["project", "--source", source, "--json"], { storage: reconcileArchiveDir });
+    assert.deepEqual(archiveProject.nodes, []);
+    const archivedNode = JSON.parse(readFileSync(nodePath(reconcileArchiveDir, archiveCapture.node.hash), "utf8"));
+    assert.equal(archivedNode.lifecycle.state, "archived");
+    const archiveRoot = readRootSnapshot(reconcileArchiveDir);
+    assert.deepEqual(archiveRoot.activeNodes, []);
+    assert.deepEqual(archiveRoot.archivedNodes, [archiveCapture.node.hash]);
+    const archiveEvents = run(["events", "--json"], { storage: reconcileArchiveDir });
+    assert(archiveEvents.events.some((event: any) =>
+      event.eventHash === archiveReconcile.event.eventHash &&
+      event.mode === "context-reconcile"
+    ));
+
+    resetStorage(reconcileRefreshDir);
+    const refreshSource = tempFixture("reconcile-refresh.0");
+    const refreshCapture = run(["capture-repair", "--source", refreshSource], { storage: reconcileRefreshDir });
+    let refreshText = readFileSync(refreshSource, "utf8");
+    refreshText = refreshText.replace(/\blet\b/g, "var");
+    refreshText = refreshText.replace("    check world.out.write", "    let relocated = 1\n    check world.out.write");
+    writeFileSync(refreshSource, refreshText);
+    const refreshBeforeRoot = readRootPointer(reconcileRefreshDir).currentRoot;
+    const refreshReconcile = run(["reconcile", "--node", refreshCapture.node.hash, "--action", "refresh-anchor", "--json"], { storage: reconcileRefreshDir });
+    assert.equal(refreshReconcile.ok, true);
+    assert.equal(refreshReconcile.action, "refresh-anchor");
+    assert.notEqual(refreshReconcile.node.hash, refreshCapture.node.hash);
+    assert.deepEqual(refreshReconcile.node.parents, [refreshCapture.node.hash]);
+    assert.equal(refreshReconcile.node.sourceAnchor.range.start.line, 5);
+    assert.notEqual(refreshReconcile.rootTransition.currentRoot, refreshBeforeRoot);
+    const refreshedOldNode = JSON.parse(readFileSync(nodePath(reconcileRefreshDir, refreshCapture.node.hash), "utf8"));
+    assert.equal(refreshedOldNode.lifecycle.state, "superseded");
+    assert.equal(refreshedOldNode.lifecycle.supersededBy, refreshReconcile.node.hash);
+    const refreshRoot = readRootSnapshot(reconcileRefreshDir);
+    assert.deepEqual(refreshRoot.activeNodes, [refreshReconcile.node.hash]);
+    assert.deepEqual(refreshRoot.supersededNodes, [refreshCapture.node.hash]);
+    const refreshEvents = run(["events", "--json"], { storage: reconcileRefreshDir });
+    assert(refreshEvents.events.some((event: any) => event.mode === "context-reconcile"));
+
+    resetStorage(reconcileSupersedeDir);
+    const supersedeCapture = run(["capture-repair", "--source", source], { storage: reconcileSupersedeDir });
+    const supersedeBeforeRoot = readRootPointer(reconcileSupersedeDir).currentRoot;
+    const supersedeReconcile = run(["reconcile", "--node", supersedeCapture.node.hash, "--action", "supersede", "--summary", "Updated reconcile summary.", "--json"], { storage: reconcileSupersedeDir });
+    assert.equal(supersedeReconcile.ok, true);
+    assert.equal(supersedeReconcile.action, "supersede");
+    assert.notEqual(supersedeReconcile.node.hash, supersedeCapture.node.hash);
+    assert.equal(supersedeReconcile.node.residualSummary, "Updated reconcile summary.");
+    assert.deepEqual(supersedeReconcile.node.parents, [supersedeCapture.node.hash]);
+    assert.notEqual(supersedeReconcile.rootTransition.currentRoot, supersedeBeforeRoot);
+    const supersedeProject = run(["project", "--source", source, "--json"], { storage: reconcileSupersedeDir });
+    assert.equal(supersedeProject.nodes.length, 1);
+    assert.equal(supersedeProject.nodes[0].hash, supersedeReconcile.node.hash);
+    const supersedeRoot = readRootSnapshot(reconcileSupersedeDir);
+    assert.deepEqual(supersedeRoot.activeNodes, [supersedeReconcile.node.hash]);
+    assert.deepEqual(supersedeRoot.supersededNodes, [supersedeCapture.node.hash]);
+    const supersedeEvents = run(["events", "--json"], { storage: reconcileSupersedeDir });
+    assert(supersedeEvents.events.some((event: any) => event.mode === "context-reconcile"));
+  } finally {
+    for (const dir of [reconcileHappyDir, reconcileMismatchDir, reconcileArchiveDir, reconcileRefreshDir, reconcileSupersedeDir]) resetStorage(dir);
+  }
+
   resetStorage();
   const previewPlan = tempJson("preview-plan.json", {
     schemaVersion: 1,

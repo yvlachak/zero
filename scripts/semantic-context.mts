@@ -41,14 +41,14 @@ type SemanticNode = {
   };
   parents: string[];
   lifecycle: {
-    state: "active" | "superseded";
+    state: "active" | "superseded" | "archived";
     supersedes: string[];
     supersededBy: string | null;
   };
   hash: string;
 };
 
-type RootReason = "init" | "capture-repair" | "capture-fix-plan" | "manual";
+type RootReason = "init" | "capture-repair" | "capture-fix-plan" | "reconcile" | "manual";
 
 type RootSnapshot = {
   schemaVersion: 1;
@@ -57,6 +57,7 @@ type RootSnapshot = {
   reason: RootReason;
   activeNodes: string[];
   supersededNodes: string[];
+  archivedNodes: string[];
   nodes: string[];
   createdAt: null;
   indexes: {
@@ -93,11 +94,7 @@ type Diagnostic = {
 type NodeVerification = {
   hash: string;
   nodeId: string;
-  lifecycle: {
-    state: "active" | "superseded";
-    supersedes: string[];
-    supersededBy: string | null;
-  };
+  lifecycle: SemanticNode["lifecycle"];
   sourceAnchor: {
     path: string;
     status: string;
@@ -115,11 +112,7 @@ type NodeSummary = {
   hash: string;
   nodeId: string;
   kind: string;
-  lifecycle: {
-    state: "active" | "superseded";
-    supersedes: string[];
-    supersededBy: string | null;
-  };
+  lifecycle: SemanticNode["lifecycle"];
 };
 
 type NodeChange = {
@@ -177,7 +170,7 @@ type ContextEvent = {
   kind: "context-event";
   eventId: string;
   eventHash: string;
-  mode: "context-check-cycle";
+  mode: "context-check-cycle" | "context-reconcile";
   sourceFile: string;
   previousRoot: string;
   currentRoot: string;
@@ -185,7 +178,7 @@ type ContextEvent = {
   captured: Array<{
     nodeId: string;
     hash: string;
-    action: CapturedFixPlanNode["action"];
+    action: CapturedFixPlanNode["action"] | "archived";
   }>;
   skipped: SkippedFixPlanNode[];
   verification: {
@@ -274,6 +267,8 @@ function usage(): never {
   semantic-context timeline [--source <file>] --json
   semantic-context compliance [--source <file>] --json
   semantic-context policy [--source <file>] [--policy advisory|verified|strict] --json
+  semantic-context reconcile --source <file> --json
+  semantic-context reconcile --node <hash> --action archive|refresh-anchor|supersede [--summary <text>] --json
   semantic-context diff --from <context-dir-or-root-snapshot> --to <context-dir-or-root-snapshot> --json`);
   process.exit(1);
 }
@@ -307,6 +302,18 @@ function parseArgs(argv: string[]) {
       const value = rest[++i];
       if (!value) usage();
       options.policy = value;
+    } else if (arg === "--node") {
+      const value = rest[++i];
+      if (!value) usage();
+      options.node = value;
+    } else if (arg === "--action") {
+      const value = rest[++i];
+      if (!value) usage();
+      options.action = value;
+    } else if (arg === "--summary") {
+      const value = rest[++i];
+      if (!value) usage();
+      options.summary = value;
     } else {
       usage();
     }
@@ -362,7 +369,7 @@ function withoutHashWithLifecycle(node: SemanticNode): JsonValue {
   return payload as JsonValue;
 }
 
-function rootPayload(nodes: string[], supersededNodes: string[], parentRoot: string | null, reason: RootReason, sourceIndex = sourceIndexDisplayPath): JsonValue {
+function rootPayload(nodes: string[], supersededNodes: string[], archivedNodes: string[], parentRoot: string | null, reason: RootReason, sourceIndex = sourceIndexDisplayPath): JsonValue {
   return {
     schemaVersion: 1,
     parentRoot,
@@ -370,6 +377,7 @@ function rootPayload(nodes: string[], supersededNodes: string[], parentRoot: str
     activeNodes: nodes,
     nodes,
     supersededNodes,
+    archivedNodes,
     createdAt: null,
     indexes: {
       sourceIndex,
@@ -377,22 +385,23 @@ function rootPayload(nodes: string[], supersededNodes: string[], parentRoot: str
   };
 }
 
-export function rootPayloadForSourceIndex(nodes: string[], sourceIndex: string, supersededNodes: string[] = [], parentRoot: string | null = null, reason: RootReason = "manual"): JsonValue {
+export function rootPayloadForSourceIndex(nodes: string[], sourceIndex: string, supersededNodes: string[] = [], parentRoot: string | null = null, reason: RootReason = "manual", archivedNodes: string[] = []): JsonValue {
   const activeNodes = [...new Set(nodes)].sort();
-  const archivedNodes = [...new Set(supersededNodes)].sort();
-  return rootPayload(activeNodes, archivedNodes, parentRoot, reason, sourceIndex);
+  const superseded = [...new Set(supersededNodes)].sort();
+  const archived = [...new Set(archivedNodes)].sort();
+  return rootPayload(activeNodes, superseded, archived, parentRoot, reason, sourceIndex);
 }
 
 export function nodeHash(node: SemanticNode) {
   return sha256Text(canonicalize(withoutHash(node)));
 }
 
-function rootHash(nodes: string[], supersededNodes: string[], parentRoot: string | null, reason: RootReason) {
-  return sha256Text(canonicalize(rootPayload(nodes, supersededNodes, parentRoot, reason)));
+function rootHash(nodes: string[], supersededNodes: string[], parentRoot: string | null, reason: RootReason, archivedNodes: string[] = []) {
+  return sha256Text(canonicalize(rootPayload(nodes, supersededNodes, archivedNodes, parentRoot, reason)));
 }
 
-export function rootHashForSourceIndex(nodes: string[], sourceIndex: string, supersededNodes: string[] = [], parentRoot: string | null = null, reason: RootReason = "manual") {
-  return sha256Text(canonicalize(rootPayloadForSourceIndex(nodes, sourceIndex, supersededNodes, parentRoot, reason)));
+export function rootHashForSourceIndex(nodes: string[], sourceIndex: string, supersededNodes: string[] = [], parentRoot: string | null = null, reason: RootReason = "manual", archivedNodes: string[] = []) {
+  return sha256Text(canonicalize(rootPayloadForSourceIndex(nodes, sourceIndex, supersededNodes, parentRoot, reason, archivedNodes)));
 }
 
 function writeJson(filePath: string, value: JsonValue) {
@@ -411,8 +420,12 @@ function supersededNodesOf(root: RootSnapshot) {
   return [...new Set(root.supersededNodes ?? [])].sort();
 }
 
+function archivedNodesOf(root: RootSnapshot) {
+  return [...new Set(root.archivedNodes ?? [])].sort();
+}
+
 function allRootNodes(root: RootSnapshot) {
-  return [...new Set([...activeNodesOf(root), ...supersededNodesOf(root)])].sort();
+  return [...new Set([...activeNodesOf(root), ...supersededNodesOf(root), ...archivedNodesOf(root)])].sort();
 }
 
 function rootSnapshotPath(hash: string) {
@@ -430,11 +443,12 @@ function readRootSnapshotByHash(hash: string) {
   return readJson<RootSnapshot>(rootSnapshotPath(hash));
 }
 
-function writeRoot(nodes: string[], supersededNodes: string[] = [], reason: RootReason = "manual") {
+function writeRoot(nodes: string[], supersededNodes: string[] = [], reason: RootReason = "manual", archivedNodes: string[] = []) {
   const sortedNodes = [...new Set(nodes)].sort();
   const sortedSupersededNodes = [...new Set(supersededNodes)].sort();
+  const sortedArchivedNodes = [...new Set(archivedNodes)].sort();
   const previousRoot = readRootPointer()?.currentRoot ?? (existsSync(rootPath) ? readJson<RootSnapshot>(rootPath).contextRoot ?? null : null);
-  const payload = rootPayload(sortedNodes, sortedSupersededNodes, previousRoot, reason);
+  const payload = rootPayload(sortedNodes, sortedSupersededNodes, sortedArchivedNodes, previousRoot, reason);
   const contextRoot = sha256Text(canonicalize(payload));
   const snapshot: RootSnapshot = {
     contextRoot,
@@ -709,6 +723,7 @@ function storeNode(node: SemanticNode, reason: RootReason): StoreResult {
   const root = readRoot();
   let activeNodes = activeNodesOf(root);
   let supersededNodes = supersededNodesOf(root);
+  const archivedNodes = archivedNodesOf(root);
   const prior = findActiveNodeById(root, node.nodeId);
   node.lifecycle = activeLifecycle();
   if (!prior) {
@@ -716,7 +731,7 @@ function storeNode(node: SemanticNode, reason: RootReason): StoreResult {
     node.hash = nodeHash(node);
     writeNode(node);
     activeNodes = [...activeNodes, node.hash];
-    writeRoot(activeNodes, supersededNodes, reason);
+    writeRoot(activeNodes, supersededNodes, reason, archivedNodes);
     rebuildSourceIndex(activeNodes);
     return { action: "added", node, supersededHash: null };
   }
@@ -747,7 +762,7 @@ function storeNode(node: SemanticNode, reason: RootReason): StoreResult {
   writeNode(node);
   activeNodes = activeNodes.map((hash) => hash === prior.hash ? node.hash : hash);
   supersededNodes = [...supersededNodes, prior.hash];
-  writeRoot(activeNodes, supersededNodes, reason);
+  writeRoot(activeNodes, supersededNodes, reason, archivedNodes);
   rebuildSourceIndex(activeNodes);
   return { action: "superseded", node, supersededHash: prior.hash };
 }
@@ -1258,8 +1273,9 @@ function verifyContext(includeSuperseded: boolean) {
   const root = readRoot();
   const activeNodes = activeNodesOf(root);
   const supersededNodes = supersededNodesOf(root);
+  const archivedNodes = archivedNodesOf(root);
   const checkedHashes = includeSuperseded ? allRootNodes(root) : activeNodes;
-  const expectedRoot = rootHash(activeNodes, supersededNodes, root.parentRoot, root.reason);
+  const expectedRoot = rootHash(activeNodes, supersededNodes, root.parentRoot, root.reason, archivedNodes);
   if (root.contextRoot !== expectedRoot) {
     pushDiagnostic(diagnostics, {
       code: "CTX-ROOT",
@@ -1449,7 +1465,7 @@ function isContextEvent(value: unknown): value is ContextEvent {
     value.kind === "context-event" &&
     typeof value.eventId === "string" &&
     typeof value.eventHash === "string" &&
-    value.mode === "context-check-cycle" &&
+    (value.mode === "context-check-cycle" || value.mode === "context-reconcile") &&
     typeof value.sourceFile === "string" &&
     typeof value.previousRoot === "string" &&
     typeof value.currentRoot === "string" &&
@@ -1556,7 +1572,7 @@ function commandTimeline(sourceOption: string | boolean | undefined) {
 }
 
 function rootHashFromSnapshot(root: RootSnapshot) {
-  return rootHashForSourceIndex(activeNodesOf(root), root.indexes.sourceIndex, supersededNodesOf(root), root.parentRoot, root.reason);
+  return rootHashForSourceIndex(activeNodesOf(root), root.indexes.sourceIndex, supersededNodesOf(root), root.parentRoot, root.reason, archivedNodesOf(root));
 }
 
 function isRootSnapshot(value: unknown): value is RootSnapshot {
@@ -1568,6 +1584,7 @@ function isRootSnapshot(value: unknown): value is RootSnapshot {
     typeof value.reason === "string" &&
     Array.isArray(value.activeNodes) &&
     Array.isArray(value.supersededNodes) &&
+    (Array.isArray(value.archivedNodes) || value.archivedNodes === undefined) &&
     Array.isArray(value.nodes) &&
     isObject(value.indexes) &&
     typeof value.indexes.sourceIndex === "string"
@@ -2055,6 +2072,372 @@ function commandPolicy(sourceOption: string | boolean | undefined, policyOption:
   if (result.policy.mode !== "advisory" && !result.policy.ok) process.exitCode = 1;
 }
 
+function findNodeByHashInRoot(root: RootSnapshot, hash: string) {
+  if (!allRootNodes(root).includes(hash)) return null;
+  const filePath = nodePath(hash);
+  if (!existsSync(filePath)) return null;
+  return readNode(hash);
+}
+
+function reconcileEvent(sourceFile: string, previousRoot: string, diagnostics: Diagnostic[], captured: ContextEvent["captured"]) {
+  const currentRoot = currentRootHash();
+  return writeContextEvent({
+    schemaVersion: 1,
+    kind: "context-event",
+    mode: "context-reconcile",
+    sourceFile,
+    previousRoot,
+    currentRoot,
+    rootChanged: previousRoot !== currentRoot,
+    captured,
+    skipped: [],
+    verification: {
+      ok: !hasError(diagnostics),
+      checkedNodes: captured.length,
+    },
+    diagnostics,
+  });
+}
+
+function sourceReconcileCandidates(source: string) {
+  const diagnostics: Diagnostic[] = [];
+  const root = readRoot();
+  const actions = [];
+  for (const hash of activeNodesOf(root)) {
+    if (!existsSync(nodePath(hash))) continue;
+    const node = readNode(hash);
+    if (node.sourceAnchor.path !== source) continue;
+    const nodeDiagnostics: Diagnostic[] = [];
+    verifyNode(node, nodePath(hash), nodeDiagnostics);
+    for (const diagnostic of nodeDiagnostics) {
+      diagnostics.push(diagnostic);
+      if (
+        diagnostic.code === "CTX_PRECONDITION_MISMATCH" ||
+        diagnostic.code === "CTX_ANCHOR_RANGE_INVALID" ||
+        diagnostic.code === "CTX_SOURCE_HASH_MISMATCH"
+      ) {
+        actions.push({
+          nodeId: node.nodeId,
+          hash,
+          action: "refresh-anchor",
+          reason: diagnostic.code,
+        });
+      } else if (diagnostic.code === "CTX_SOURCE_MISSING") {
+        actions.push({
+          nodeId: node.nodeId,
+          hash,
+          action: "archive",
+          reason: diagnostic.code,
+        });
+      }
+    }
+  }
+  if (diagnostics.length > 0) {
+    pushDiagnostic(diagnostics, {
+      code: "CTX_RECONCILE_SOURCE_VERIFY_FAILED",
+      message: "source context verification reported reconcile candidates",
+      path: source,
+    });
+  }
+  return {
+    schemaVersion: 1,
+    mode: "context-reconcile",
+    ok: diagnostics.length === 0,
+    sourceFile: source,
+    actions,
+    diagnostics,
+  };
+}
+
+function findUniqueTextRange(source: string, text: string): SourceRange | null | "ambiguous" {
+  if (text.length === 0) return null;
+  const matches: SourceRange[] = [];
+  const lines = source.split(/\n/);
+  for (let lineIndex = 0; lineIndex < lines.length; lineIndex++) {
+    const line = lines[lineIndex];
+    let offset = line.indexOf(text);
+    while (offset >= 0) {
+      matches.push({
+        start: {
+          line: lineIndex + 1,
+          column: Buffer.byteLength(line.slice(0, offset), "utf8") + 1,
+        },
+        end: {
+          line: lineIndex + 1,
+          column: Buffer.byteLength(line.slice(0, offset), "utf8") + Buffer.byteLength(text, "utf8") + 1,
+        },
+        columnUnit: "utf8-byte",
+      });
+      offset = line.indexOf(text, offset + text.length);
+    }
+  }
+  if (matches.length === 0) return null;
+  if (matches.length > 1) return "ambiguous";
+  return matches[0];
+}
+
+function requireActiveNode(hashOption: string | boolean | undefined, diagnostics: Diagnostic[]) {
+  if (typeof hashOption !== "string") usage();
+  const root = readRoot();
+  const activeHashes = activeNodesOf(root);
+  if (!allRootNodes(root).includes(hashOption)) {
+    pushDiagnostic(diagnostics, {
+      code: "CTX_RECONCILE_NODE_NOT_FOUND",
+      message: "context node is not referenced by the current root",
+      hash: hashOption,
+    });
+    return null;
+  }
+  if (!activeHashes.includes(hashOption)) {
+    pushDiagnostic(diagnostics, {
+      code: "CTX_RECONCILE_NODE_NOT_ACTIVE",
+      message: "reconcile action requires an active context node",
+      hash: hashOption,
+    });
+    return null;
+  }
+  const node = findNodeByHashInRoot(root, hashOption);
+  if (!node) {
+    pushDiagnostic(diagnostics, {
+      code: "CTX_RECONCILE_NODE_NOT_FOUND",
+      message: "context node file does not exist",
+      hash: hashOption,
+      path: displayPath(nodePath(hashOption)),
+    });
+    return null;
+  }
+  return { root, node, hash: hashOption };
+}
+
+function replaceActiveNode(root: RootSnapshot, oldHash: string, oldNode: SemanticNode, nextNode: SemanticNode) {
+  const activeNodes = activeNodesOf(root).map((hash) => hash === oldHash ? nextNode.hash : hash);
+  const supersededNodes = [...supersededNodesOf(root), oldHash];
+  const archivedNodes = archivedNodesOf(root);
+  const supersededNode: SemanticNode = {
+    ...oldNode,
+    lifecycle: {
+      ...lifecycleOf(oldNode),
+      state: "superseded",
+      supersededBy: nextNode.hash,
+    },
+  };
+  writeNode(supersededNode);
+  writeNode(nextNode);
+  writeRoot(activeNodes, supersededNodes, "reconcile", archivedNodes);
+  rebuildSourceIndex(activeNodes);
+}
+
+function reconcileArchive(hashOption: string | boolean | undefined) {
+  const diagnostics: Diagnostic[] = [];
+  const loaded = requireActiveNode(hashOption, diagnostics);
+  if (!loaded) return { schemaVersion: 1, mode: "context-reconcile", ok: false, action: "archive", diagnostics };
+  const previousRoot = currentRootHash();
+  const activeNodes = activeNodesOf(loaded.root).filter((hash) => hash !== loaded.hash);
+  const supersededNodes = supersededNodesOf(loaded.root);
+  const archivedNodes = [...archivedNodesOf(loaded.root), loaded.hash];
+  const archivedNode: SemanticNode = {
+    ...loaded.node,
+    lifecycle: {
+      ...lifecycleOf(loaded.node),
+      state: "archived",
+    },
+  };
+  writeNode(archivedNode);
+  writeRoot(activeNodes, supersededNodes, "reconcile", archivedNodes);
+  rebuildSourceIndex(activeNodes);
+  const event = reconcileEvent(loaded.node.sourceAnchor.path, previousRoot, diagnostics, [{ nodeId: loaded.node.nodeId, hash: loaded.hash, action: "archived" }]);
+  return {
+    schemaVersion: 1,
+    mode: "context-reconcile",
+    ok: true,
+    action: "archive",
+    node: {
+      nodeId: loaded.node.nodeId,
+      hash: loaded.hash,
+      lifecycle: archivedNode.lifecycle,
+      sourceFile: loaded.node.sourceAnchor.path,
+    },
+    rootTransition: {
+      previousRoot,
+      currentRoot: currentRootHash(),
+      changed: previousRoot !== currentRootHash(),
+    },
+    event: {
+      eventHash: event.eventHash,
+      path: displayPath(eventPath(event.eventHash)),
+    },
+    diagnostics,
+  };
+}
+
+function firstExactTextPrecondition(node: SemanticNode) {
+  for (const edit of node.projection.frontier.edits) {
+    const precondition = edit.precondition;
+    if (precondition?.kind === "exact-text") return precondition.text;
+  }
+  return null;
+}
+
+function reconcileRefreshAnchor(hashOption: string | boolean | undefined) {
+  const diagnostics: Diagnostic[] = [];
+  const loaded = requireActiveNode(hashOption, diagnostics);
+  if (!loaded) return { schemaVersion: 1, mode: "context-reconcile", ok: false, action: "refresh-anchor", diagnostics };
+  const preconditionText = firstExactTextPrecondition(loaded.node);
+  if (preconditionText === null || !existsSync(path.join(repoRoot, loaded.node.sourceAnchor.path))) {
+    pushDiagnostic(diagnostics, {
+      code: "CTX_RECONCILE_ANCHOR_NOT_FOUND",
+      message: "refresh-anchor requires an exact-text precondition and readable source",
+      hash: loaded.hash,
+      path: loaded.node.sourceAnchor.path,
+    });
+    return { schemaVersion: 1, mode: "context-reconcile", ok: false, action: "refresh-anchor", diagnostics };
+  }
+  const source = readText(loaded.node.sourceAnchor.path);
+  const range = findUniqueTextRange(source, preconditionText);
+  if (range === null) {
+    pushDiagnostic(diagnostics, {
+      code: "CTX_RECONCILE_ANCHOR_NOT_FOUND",
+      message: "exact-text precondition was not found in source",
+      hash: loaded.hash,
+      path: loaded.node.sourceAnchor.path,
+    });
+    return { schemaVersion: 1, mode: "context-reconcile", ok: false, action: "refresh-anchor", diagnostics };
+  }
+  if (range === "ambiguous") {
+    pushDiagnostic(diagnostics, {
+      code: "CTX_RECONCILE_ANCHOR_AMBIGUOUS",
+      message: "exact-text precondition appears more than once in source",
+      hash: loaded.hash,
+      path: loaded.node.sourceAnchor.path,
+    });
+    return { schemaVersion: 1, mode: "context-reconcile", ok: false, action: "refresh-anchor", diagnostics };
+  }
+  const previousRoot = currentRootHash();
+  const nextNode: SemanticNode = {
+    ...loaded.node,
+    sourceAnchor: {
+      ...loaded.node.sourceAnchor,
+      range,
+      sourceHash: sha256Text(source),
+    },
+    parents: [loaded.hash],
+    lifecycle: {
+      state: "active",
+      supersedes: [loaded.hash],
+      supersededBy: null,
+    },
+    hash: "",
+  };
+  nextNode.hash = nodeHash(nextNode);
+  replaceActiveNode(loaded.root, loaded.hash, loaded.node, nextNode);
+  const event = reconcileEvent(nextNode.sourceAnchor.path, previousRoot, diagnostics, [{ nodeId: nextNode.nodeId, hash: nextNode.hash, action: "superseded" }]);
+  return {
+    schemaVersion: 1,
+    mode: "context-reconcile",
+    ok: true,
+    action: "refresh-anchor",
+    node: {
+      nodeId: nextNode.nodeId,
+      hash: nextNode.hash,
+      parents: nextNode.parents,
+      lifecycle: nextNode.lifecycle,
+      sourceAnchor: nextNode.sourceAnchor,
+    },
+    supersededHash: loaded.hash,
+    rootTransition: {
+      previousRoot,
+      currentRoot: currentRootHash(),
+      changed: previousRoot !== currentRootHash(),
+    },
+    event: {
+      eventHash: event.eventHash,
+      path: displayPath(eventPath(event.eventHash)),
+    },
+    diagnostics,
+  };
+}
+
+function reconcileSupersede(hashOption: string | boolean | undefined, summaryOption: string | boolean | undefined) {
+  const diagnostics: Diagnostic[] = [];
+  if (typeof summaryOption !== "string") usage();
+  const loaded = requireActiveNode(hashOption, diagnostics);
+  if (!loaded) return { schemaVersion: 1, mode: "context-reconcile", ok: false, action: "supersede", diagnostics };
+  const previousRoot = currentRootHash();
+  const nextNode: SemanticNode = {
+    ...loaded.node,
+    residualSummary: summaryOption,
+    sourceAnchor: {
+      ...loaded.node.sourceAnchor,
+      sourceHash: existsSync(path.join(repoRoot, loaded.node.sourceAnchor.path)) ? sha256File(loaded.node.sourceAnchor.path) : loaded.node.sourceAnchor.sourceHash,
+    },
+    parents: [loaded.hash],
+    lifecycle: {
+      state: "active",
+      supersedes: [loaded.hash],
+      supersededBy: null,
+    },
+    hash: "",
+  };
+  nextNode.hash = nodeHash(nextNode);
+  replaceActiveNode(loaded.root, loaded.hash, loaded.node, nextNode);
+  const event = reconcileEvent(nextNode.sourceAnchor.path, previousRoot, diagnostics, [{ nodeId: nextNode.nodeId, hash: nextNode.hash, action: "superseded" }]);
+  return {
+    schemaVersion: 1,
+    mode: "context-reconcile",
+    ok: true,
+    action: "supersede",
+    node: {
+      nodeId: nextNode.nodeId,
+      hash: nextNode.hash,
+      parents: nextNode.parents,
+      lifecycle: nextNode.lifecycle,
+      residualSummary: nextNode.residualSummary,
+    },
+    supersededHash: loaded.hash,
+    rootTransition: {
+      previousRoot,
+      currentRoot: currentRootHash(),
+      changed: previousRoot !== currentRootHash(),
+    },
+    event: {
+      eventHash: event.eventHash,
+      path: displayPath(eventPath(event.eventHash)),
+    },
+    diagnostics,
+  };
+}
+
+function commandReconcile(sourceOption: string | boolean | undefined, nodeOption: string | boolean | undefined, actionOption: string | boolean | undefined, summaryOption: string | boolean | undefined) {
+  ensureLayout();
+  let result;
+  if (typeof sourceOption === "string" && actionOption === undefined && nodeOption === undefined) {
+    result = sourceReconcileCandidates(repoRelative(sourceOption));
+  } else if (actionOption === "archive") {
+    result = reconcileArchive(nodeOption);
+  } else if (actionOption === "refresh-anchor") {
+    result = reconcileRefreshAnchor(nodeOption);
+  } else if (actionOption === "supersede") {
+    result = reconcileSupersede(nodeOption, summaryOption);
+  } else if (actionOption === undefined) {
+    const diagnostics: Diagnostic[] = [];
+    pushDiagnostic(diagnostics, {
+      code: "CTX_RECONCILE_NO_ACTION",
+      message: "reconcile requires --source or --node with --action",
+    });
+    result = { schemaVersion: 1, mode: "context-reconcile", ok: false, diagnostics };
+  } else {
+    const diagnostics: Diagnostic[] = [];
+    pushDiagnostic(diagnostics, {
+      code: "CTX_RECONCILE_UNSUPPORTED_ACTION",
+      message: "reconcile action is not supported",
+      actual: String(actionOption),
+    });
+    result = { schemaVersion: 1, mode: "context-reconcile", ok: false, diagnostics };
+  }
+  console.log(JSON.stringify(result, null, 2));
+  if (!result.ok) process.exitCode = 1;
+}
+
 function resolveContextInput(input: string) {
   if (input.startsWith("sha256:")) {
     return {
@@ -2301,6 +2684,7 @@ export function main(argv = process.argv.slice(2)) {
   else if (command === "timeline") commandTimeline(options.source);
   else if (command === "compliance") commandCompliance(options.source);
   else if (command === "policy") commandPolicy(options.source, options.policy);
+  else if (command === "reconcile") commandReconcile(options.source, options.node, options.action, options.summary);
   else if (command === "diff") commandDiff(options.from, options.to);
   else usage();
 }
