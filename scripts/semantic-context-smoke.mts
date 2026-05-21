@@ -389,6 +389,27 @@ try {
   assert.equal(sourceCompliance.anchors.checked, 1);
   assert.deepEqual(sourceCompliance.diagnostics, []);
 
+  const advisoryPolicy = run(["policy", "--json"]);
+  assert.equal(advisoryPolicy.schemaVersion, 1);
+  assert.equal(advisoryPolicy.mode, "context-policy");
+  assert.equal(advisoryPolicy.policy.mode, "advisory");
+  assert.equal(advisoryPolicy.policy.ok, true);
+  assert.equal(advisoryPolicy.policy.status, "advisory");
+  assert.equal(advisoryPolicy.compliance.ok, true);
+  assert.deepEqual(advisoryPolicy.diagnostics, []);
+
+  const verifiedPolicy = run(["policy", "--policy", "verified", "--json"]);
+  assert.equal(verifiedPolicy.policy.mode, "verified");
+  assert.equal(verifiedPolicy.policy.ok, true);
+  assert.equal(verifiedPolicy.policy.status, "verified");
+  assert.equal(verifiedPolicy.compliance.ok, true);
+
+  const strictPolicy = run(["policy", "--policy", "strict", "--json"]);
+  assert.equal(strictPolicy.policy.mode, "strict");
+  assert.equal(strictPolicy.policy.ok, true);
+  assert.equal(strictPolicy.policy.status, "strict");
+  assert.equal(strictPolicy.compliance.ok, true);
+
   const tamperedEvent = {
     ...checkCycleEvent,
     rootChanged: false,
@@ -420,7 +441,24 @@ try {
   const tamperedEventDir = path.join("/tmp", `zero-semantic-context-tampered-event-${process.pid}`);
   const tamperedNodeDir = path.join("/tmp", `zero-semantic-context-tampered-node-${process.pid}`);
   const staleIndexDir = path.join("/tmp", `zero-semantic-context-stale-index-${process.pid}`);
+  const strictCycleDir = path.join("/tmp", `zero-semantic-context-strict-cycle-${process.pid}`);
+  const verifiedCycleDir = path.join("/tmp", `zero-semantic-context-verified-cycle-${process.pid}`);
   try {
+    resetStorage(strictCycleDir);
+    run(["init"], { storage: strictCycleDir });
+    const strictCycle = run(["check-cycle", "--source", source, "--json", "--policy", "strict"], { storage: strictCycleDir });
+    assert.equal(strictCycle.policy.mode, "strict");
+    assert.equal(strictCycle.policy.ok, true);
+    assert.equal(strictCycle.compliance.ok, true);
+    assert.equal(strictCycle.compliance.anchors.ok, true);
+
+    resetStorage(verifiedCycleDir);
+    run(["init"], { storage: verifiedCycleDir });
+    const verifiedCycle = run(["check-cycle", "--source", source, "--json", "--policy", "verified"], { storage: verifiedCycleDir });
+    assert.equal(verifiedCycle.policy.mode, "verified");
+    assert.equal(verifiedCycle.policy.ok, true);
+    assert.equal(verifiedCycle.compliance.ok, true);
+
     resetStorage(missingRootDir);
     run(["init"], { storage: missingRootDir });
     const missingRootCycle = run(["check-cycle", "--source", source, "--json"], { storage: missingRootDir });
@@ -477,8 +515,22 @@ try {
       diagnostic.code === "CTX_COMPLIANCE_SOURCE_INDEX_STALE" &&
       diagnostic.severity === "error"
     ));
+    const staleStrictPolicy = run(["policy", "--policy", "strict", "--json"], { storage: staleIndexDir, allowFailure: true });
+    assert.equal(staleStrictPolicy.policy.mode, "strict");
+    assert.equal(staleStrictPolicy.policy.ok, false);
+    assert(staleStrictPolicy.diagnostics.some((diagnostic: any) =>
+      diagnostic.code === "CTX_POLICY_STRICT_INDEX_FAILED" &&
+      diagnostic.severity === "error"
+    ));
+    const staleAdvisoryPolicy = run(["policy", "--json"], { storage: staleIndexDir });
+    assert.equal(staleAdvisoryPolicy.policy.mode, "advisory");
+    assert.equal(staleAdvisoryPolicy.policy.ok, true);
+    assert(staleAdvisoryPolicy.diagnostics.some((diagnostic: any) =>
+      diagnostic.code === "CTX_COMPLIANCE_SOURCE_INDEX_STALE" &&
+      diagnostic.severity === "error"
+    ));
   } finally {
-    for (const dir of [missingRootDir, tamperedEventDir, tamperedNodeDir, staleIndexDir]) resetStorage(dir);
+    for (const dir of [missingRootDir, tamperedEventDir, tamperedNodeDir, staleIndexDir, strictCycleDir, verifiedCycleDir]) resetStorage(dir);
   }
 
   resetStorage();

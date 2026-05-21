@@ -228,6 +228,8 @@ type ComplianceRootState = {
   rootDepth: number;
 };
 
+type PolicyMode = "advisory" | "verified" | "strict";
+
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(scriptDir, "..");
 function displayPath(filePath: string) {
@@ -271,6 +273,7 @@ function usage(): never {
   semantic-context events --json
   semantic-context timeline [--source <file>] --json
   semantic-context compliance [--source <file>] --json
+  semantic-context policy [--source <file>] [--policy advisory|verified|strict] --json
   semantic-context diff --from <context-dir-or-root-snapshot> --to <context-dir-or-root-snapshot> --json`);
   process.exit(1);
 }
@@ -300,6 +303,10 @@ function parseArgs(argv: string[]) {
       const value = rest[++i];
       if (!value) usage();
       options.fixPlanJson = value;
+    } else if (arg === "--policy") {
+      const value = rest[++i];
+      if (!value) usage();
+      options.policy = value;
     } else {
       usage();
     }
@@ -1299,7 +1306,7 @@ function commandVerify(includeSupersededOption: string | boolean | undefined) {
   if (diagnostics.length > 0) process.exitCode = 1;
 }
 
-function commandCheckCycle(sourceOption: string | boolean | undefined) {
+function commandCheckCycle(sourceOption: string | boolean | undefined, policyOption: string | boolean | undefined) {
   if (typeof sourceOption !== "string") usage();
   ensureLayout();
   const source = repoRelative(sourceOption);
@@ -1334,6 +1341,9 @@ function commandCheckCycle(sourceOption: string | boolean | undefined) {
     },
     diagnostics,
   });
+  const compliance = policyOption === undefined ? null : buildComplianceResult(source);
+  const policy = compliance ? buildPolicyResult(policyOption, source, compliance) : null;
+  const outputDiagnostics = policy ? [...diagnostics, ...policy.diagnostics] : diagnostics;
   console.log(JSON.stringify({
     schemaVersion: 1,
     mode: "context-check-cycle",
@@ -1359,9 +1369,16 @@ function commandCheckCycle(sourceOption: string | boolean | undefined) {
       eventHash: event.eventHash,
       path: displayPath(eventPath(event.eventHash)),
     },
-    diagnostics,
+    ...(policy ? {
+      policy: {
+        mode: policy.policy.mode,
+        ok: policy.policy.ok,
+      },
+      compliance,
+    } : {}),
+    diagnostics: outputDiagnostics,
   }, null, 2));
-  if (hasError(diagnostics)) process.exitCode = 1;
+  if (hasError(diagnostics) || (policy && policy.policy.mode !== "advisory" && !policy.policy.ok)) process.exitCode = 1;
 }
 
 function readContextEvents(diagnostics: Diagnostic[]) {
@@ -1771,7 +1788,7 @@ function verifyAnchorOnly(node: SemanticNode, diagnostics: Diagnostic[]) {
   return ok;
 }
 
-function commandCompliance(sourceOption: string | boolean | undefined) {
+function buildComplianceResult(sourceOption: string | boolean | undefined) {
   const source = typeof sourceOption === "string" ? repoRelative(sourceOption) : null;
   const diagnostics: Diagnostic[] = [];
   const rootState = readComplianceRoot(diagnostics);
@@ -1921,7 +1938,7 @@ function commandCompliance(sourceOption: string | boolean | undefined) {
       }
     }
   }
-  const result = {
+  return {
     schemaVersion: 1,
     mode: "context-compliance",
     ok: diagnostics.length === 0,
@@ -1957,8 +1974,85 @@ function commandCompliance(sourceOption: string | boolean | undefined) {
     },
     diagnostics,
   };
+}
+
+function commandCompliance(sourceOption: string | boolean | undefined) {
+  const result = buildComplianceResult(sourceOption);
   console.log(JSON.stringify(result, null, 2));
-  if (diagnostics.length > 0) process.exitCode = 1;
+  if (result.diagnostics.length > 0) process.exitCode = 1;
+}
+
+function policyModeFromOption(policyOption: string | boolean | undefined): PolicyMode {
+  if (policyOption === undefined) return "advisory";
+  if (policyOption === "advisory" || policyOption === "verified" || policyOption === "strict") return policyOption;
+  usage();
+}
+
+function buildPolicyResult(policyOption: string | boolean | undefined, sourceOption: string | boolean | undefined, compliance = buildComplianceResult(sourceOption)) {
+  const mode = policyModeFromOption(policyOption);
+  const diagnostics: Diagnostic[] = [...compliance.diagnostics];
+  let ok = true;
+  if (mode === "verified" && !compliance.ok) {
+    ok = false;
+    pushDiagnostic(diagnostics, {
+      code: "CTX_POLICY_COMPLIANCE_FAILED",
+      message: "verified context policy requires compliant semantic context",
+    });
+  }
+  if (mode === "strict") {
+    if (!compliance.ok) {
+      ok = false;
+      pushDiagnostic(diagnostics, {
+        code: "CTX_POLICY_COMPLIANCE_FAILED",
+        message: "strict context policy requires compliant semantic context",
+      });
+    }
+    if (!compliance.anchors.ok) {
+      ok = false;
+      pushDiagnostic(diagnostics, {
+        code: "CTX_POLICY_STRICT_ANCHOR_FAILED",
+        message: "strict context policy requires active source anchors to verify",
+      });
+    }
+    if (compliance.timeline.hashFailures !== 0 || compliance.timeline.missingRoots !== 0) {
+      ok = false;
+      pushDiagnostic(diagnostics, {
+        code: "CTX_POLICY_STRICT_TIMELINE_FAILED",
+        message: "strict context policy requires an intact semantic timeline",
+      });
+    }
+    if (!compliance.nodes.lifecycleOk) {
+      ok = false;
+      pushDiagnostic(diagnostics, {
+        code: "CTX_POLICY_STRICT_LIFECYCLE_FAILED",
+        message: "strict context policy requires consistent node lifecycle state",
+      });
+    }
+    if (!compliance.indexes.sourceIndexOk) {
+      ok = false;
+      pushDiagnostic(diagnostics, {
+        code: "CTX_POLICY_STRICT_INDEX_FAILED",
+        message: "strict context policy requires a current source index",
+      });
+    }
+  }
+  return {
+    schemaVersion: 1,
+    mode: "context-policy",
+    policy: {
+      mode,
+      ok: mode === "advisory" ? true : ok,
+      status: mode,
+    },
+    compliance,
+    diagnostics,
+  };
+}
+
+function commandPolicy(sourceOption: string | boolean | undefined, policyOption: string | boolean | undefined) {
+  const result = buildPolicyResult(policyOption, sourceOption);
+  console.log(JSON.stringify(result, null, 2));
+  if (result.policy.mode !== "advisory" && !result.policy.ok) process.exitCode = 1;
 }
 
 function resolveContextInput(input: string) {
@@ -2202,10 +2296,11 @@ export function main(argv = process.argv.slice(2)) {
   else if (command === "capture-fix-plan") commandCaptureFixPlan(options.source, options.fixPlanJson);
   else if (command === "project") commandProject(options.source, options.includeSuperseded);
   else if (command === "verify") commandVerify(options.includeSuperseded);
-  else if (command === "check-cycle") commandCheckCycle(options.source);
+  else if (command === "check-cycle") commandCheckCycle(options.source, options.policy);
   else if (command === "events") commandEvents();
   else if (command === "timeline") commandTimeline(options.source);
   else if (command === "compliance") commandCompliance(options.source);
+  else if (command === "policy") commandPolicy(options.source, options.policy);
   else if (command === "diff") commandDiff(options.from, options.to);
   else usage();
 }
