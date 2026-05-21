@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/stat.h>
 
 static const char *context_json_skip_ws(const char *cursor) {
   while (cursor && (*cursor == ' ' || *cursor == '\n' || *cursor == '\r' || *cursor == '\t')) cursor++;
@@ -282,6 +283,55 @@ static void context_json_append_escaped_string(ZBuf *out, const char *text) {
     }
   }
   zbuf_append_char(out, '"');
+}
+
+void context_diagnostic_free(ContextDiagnostic *diagnostic) {
+  if (!diagnostic) return;
+  free(diagnostic->severity);
+  free(diagnostic->code);
+  free(diagnostic->message);
+  free(diagnostic->node_id);
+  free(diagnostic->hash);
+  free(diagnostic->path);
+  free(diagnostic->expected);
+  free(diagnostic->actual);
+  memset(diagnostic, 0, sizeof(*diagnostic));
+}
+
+static void context_diagnostic_append_string_field(ZBuf *diagnostics, const char *name, const char *value) {
+  if (!value) return;
+  zbuf_append(diagnostics, ",\"");
+  zbuf_append(diagnostics, name);
+  zbuf_append(diagnostics, "\":");
+  context_json_append_escaped_string(diagnostics, value);
+}
+
+void context_diagnostic_append(
+  ZBuf *diagnostics,
+  size_t *diagnostic_count,
+  const char *severity,
+  const char *code,
+  const char *message,
+  const char *node_id,
+  const char *hash,
+  const char *path,
+  const char *expected,
+  const char *actual) {
+  if (!diagnostics || !diagnostic_count || !code || !message) return;
+  if (*diagnostic_count > 0) zbuf_append(diagnostics, ",");
+  zbuf_append(diagnostics, "{\"severity\":");
+  context_json_append_escaped_string(diagnostics, severity ? severity : "error");
+  zbuf_append(diagnostics, ",\"code\":");
+  context_json_append_escaped_string(diagnostics, code);
+  zbuf_append(diagnostics, ",\"message\":");
+  context_json_append_escaped_string(diagnostics, message);
+  context_diagnostic_append_string_field(diagnostics, "nodeId", node_id);
+  context_diagnostic_append_string_field(diagnostics, "hash", hash);
+  context_diagnostic_append_string_field(diagnostics, "path", path);
+  context_diagnostic_append_string_field(diagnostics, "expected", expected);
+  context_diagnostic_append_string_field(diagnostics, "actual", actual);
+  zbuf_append(diagnostics, "}");
+  (*diagnostic_count)++;
 }
 
 static bool context_json_canonicalize_value(ZBuf *out, const char **cursor, const char *const *excluded_keys, bool apply_exclusions);
@@ -839,4 +889,276 @@ char *context_root_payload_hash(const char *root_snapshot_json) {
   free(source_index);
   (void)parent_is_null;
   return hash;
+}
+
+void context_compliance_root_state_free(ContextComplianceRootState *state) {
+  if (!state) return;
+  free(state->pointer_json);
+  free(state->current_root);
+  free(state->current_root_snapshot_json);
+  memset(state, 0, sizeof(*state));
+}
+
+static bool context_path_exists(const char *path) {
+  if (!path) return false;
+  struct stat st;
+  return stat(path, &st) == 0;
+}
+
+static bool context_hash_list_contains(char **items, size_t count, const char *hash) {
+  if (!hash) return false;
+  for (size_t i = 0; i < count; i++) {
+    if (items[i] && strcmp(items[i], hash) == 0) return true;
+  }
+  return false;
+}
+
+static bool context_json_field_is_array(const char *json, const char *field, bool required) {
+  ZBuf raw;
+  zbuf_init(&raw);
+  if (!context_json_emit_field(&raw, json, field)) {
+    zbuf_free(&raw);
+    return !required;
+  }
+  const char *cursor = context_json_skip_ws(raw.data);
+  bool ok = cursor && *cursor == '[';
+  zbuf_free(&raw);
+  return ok;
+}
+
+static bool context_root_snapshot_schema_ok(const char *json) {
+  int schema_version = 0;
+  if (!context_json_get_int(json, "schemaVersion", &schema_version) || schema_version != 1) return false;
+  char *context_root = context_json_get_string_or_null(json, "contextRoot", NULL);
+  if (!context_root) return false;
+  free(context_root);
+  bool parent_is_null = false;
+  char *parent_root = context_json_get_string_or_null(json, "parentRoot", &parent_is_null);
+  if (!parent_root && !parent_is_null) return false;
+  free(parent_root);
+  char *reason = context_json_get_string_or_null(json, "reason", NULL);
+  if (!reason) return false;
+  free(reason);
+  if (!context_json_field_is_array(json, "activeNodes", true)) return false;
+  if (!context_json_field_is_array(json, "supersededNodes", true)) return false;
+  if (!context_json_field_is_array(json, "archivedNodes", false)) return false;
+  if (!context_json_field_is_array(json, "nodes", true)) return false;
+  char *source_index = context_json_get_nested_string(json, "indexes", "sourceIndex", NULL);
+  if (!source_index) return false;
+  free(source_index);
+  return true;
+}
+
+static char *context_snapshot_filename_hash(const char *snapshot_path) {
+  if (!snapshot_path) return NULL;
+  const char *base = strrchr(snapshot_path, '/');
+  const char *backslash = strrchr(snapshot_path, '\\');
+  if (backslash && (!base || backslash > base)) base = backslash;
+  base = base ? base + 1 : snapshot_path;
+  size_t len = strlen(base);
+  if (len > 5 && strcmp(base + len - 5, ".json") == 0) len -= 5;
+  ZBuf out;
+  zbuf_init(&out);
+  context_zbuf_append_len(&out, base, len);
+  return out.data;
+}
+
+static const char *context_bare_hash(const char *hash) {
+  return hash && strncmp(hash, "sha256:", 7) == 0 ? hash + 7 : hash;
+}
+
+static bool context_json_valid_document(const char *json) {
+  ZBuf canonical;
+  zbuf_init(&canonical);
+  bool ok = context_json_canonicalize(&canonical, json);
+  zbuf_free(&canonical);
+  return ok;
+}
+
+void context_compliance_read_root(
+  const char *storage,
+  ContextComplianceRootState *state,
+  ZBuf *diagnostics,
+  size_t *diagnostic_count) {
+  if (!state) return;
+  memset(state, 0, sizeof(*state));
+  char *root_path = context_root_pointer_path(storage);
+  if (!root_path || !context_path_exists(root_path)) {
+    context_diagnostic_append(
+      diagnostics,
+      diagnostic_count,
+      NULL,
+      "CTX_COMPLIANCE_ROOT_MISSING",
+      "context root pointer does not exist",
+      NULL,
+      NULL,
+      root_path,
+      NULL,
+      NULL);
+    free(root_path);
+    return;
+  }
+
+  ZDiag read_diag = {0};
+  char *pointer_json = z_read_file(root_path, &read_diag);
+  int schema_version = 0;
+  char *current_root = pointer_json ? context_json_get_string_or_null(pointer_json, "currentRoot", NULL) : NULL;
+  if (!pointer_json || !context_json_get_int(pointer_json, "schemaVersion", &schema_version) || schema_version != 1 || !current_root) {
+    context_diagnostic_append(
+      diagnostics,
+      diagnostic_count,
+      NULL,
+      "CTX_COMPLIANCE_ROOT_POINTER_MALFORMED",
+      pointer_json ? "context root pointer has an unsupported schema" : "context root pointer is not valid JSON",
+      NULL,
+      NULL,
+      root_path,
+      NULL,
+      NULL);
+    free(pointer_json);
+    free(current_root);
+    free(root_path);
+    return;
+  }
+
+  state->pointer_json = pointer_json;
+  state->current_root = current_root;
+
+  char **visited = NULL;
+  size_t visited_count = 0;
+  size_t visited_cap = 0;
+  char *current_hash = z_strdup(state->current_root);
+  bool parent_chain_ok = true;
+
+  while (current_hash) {
+    if (context_hash_list_contains(visited, visited_count, current_hash)) {
+      parent_chain_ok = false;
+      char *cycle_path = context_root_snapshot_path(storage, current_hash);
+      context_diagnostic_append(
+        diagnostics,
+        diagnostic_count,
+        NULL,
+        "CTX_COMPLIANCE_PARENT_CHAIN_BROKEN",
+        "context root parent chain contains a cycle",
+        NULL,
+        current_hash,
+        cycle_path,
+        NULL,
+        NULL);
+      free(cycle_path);
+      break;
+    }
+    context_hash_array_add(&visited, &visited_count, &visited_cap, z_strdup(current_hash));
+
+    char *snapshot_path = context_root_snapshot_path(storage, current_hash);
+    bool is_current_root = strcmp(current_hash, state->current_root) == 0;
+    if (!snapshot_path || !context_path_exists(snapshot_path)) {
+      parent_chain_ok = false;
+      context_diagnostic_append(
+        diagnostics,
+        diagnostic_count,
+        NULL,
+        is_current_root ? "CTX_COMPLIANCE_ROOT_SNAPSHOT_MISSING" : "CTX_COMPLIANCE_PARENT_ROOT_MISSING",
+        is_current_root ? "current root snapshot does not exist" : "parent root snapshot does not exist",
+        NULL,
+        current_hash,
+        snapshot_path,
+        NULL,
+        NULL);
+      free(snapshot_path);
+      break;
+    }
+
+    ZDiag snapshot_diag = {0};
+    char *snapshot_json = z_read_file(snapshot_path, &snapshot_diag);
+    if (!snapshot_json || !context_json_valid_document(snapshot_json)) {
+      parent_chain_ok = false;
+      context_diagnostic_append(
+        diagnostics,
+        diagnostic_count,
+        NULL,
+        "CTX_COMPLIANCE_PARENT_CHAIN_BROKEN",
+        snapshot_json ? "root snapshot is not valid JSON" : "root snapshot is not readable",
+        NULL,
+        current_hash,
+        snapshot_path,
+        NULL,
+        NULL);
+      free(snapshot_json);
+      free(snapshot_path);
+      break;
+    }
+    if (!context_root_snapshot_schema_ok(snapshot_json)) {
+      parent_chain_ok = false;
+      context_diagnostic_append(
+        diagnostics,
+        diagnostic_count,
+        NULL,
+        "CTX_COMPLIANCE_PARENT_CHAIN_BROKEN",
+        "root snapshot has an unsupported schema",
+        NULL,
+        current_hash,
+        snapshot_path,
+        NULL,
+        NULL);
+      free(snapshot_json);
+      free(snapshot_path);
+      break;
+    }
+
+    state->root_depth += 1;
+    if (is_current_root) state->current_root_snapshot_json = z_strdup(snapshot_json);
+
+    char *snapshot_root = context_json_get_string_or_null(snapshot_json, "contextRoot", NULL);
+    char *filename_hash = context_snapshot_filename_hash(snapshot_path);
+    const char *snapshot_root_bare = context_bare_hash(snapshot_root);
+    if (snapshot_root_bare && filename_hash && strcmp(filename_hash, snapshot_root_bare) != 0) {
+      context_diagnostic_append(
+        diagnostics,
+        diagnostic_count,
+        NULL,
+        "CTX_COMPLIANCE_FILENAME_MISMATCH",
+        "root snapshot filename does not match its contextRoot field",
+        NULL,
+        snapshot_root_bare,
+        snapshot_path,
+        snapshot_root_bare,
+        filename_hash);
+    }
+
+    char *expected_root = context_root_payload_hash(snapshot_json);
+    if (!snapshot_root || !expected_root || strcmp(snapshot_root, current_hash) != 0 || strcmp(snapshot_root, expected_root) != 0) {
+      parent_chain_ok = false;
+      if (is_current_root) state->root_hash_ok = false;
+      context_diagnostic_append(
+        diagnostics,
+        diagnostic_count,
+        NULL,
+        "CTX_COMPLIANCE_ROOT_HASH_MISMATCH",
+        "root snapshot hash does not match canonical payload",
+        NULL,
+        current_hash,
+        snapshot_path,
+        snapshot_root,
+        expected_root);
+    } else if (is_current_root) {
+      state->root_hash_ok = true;
+    }
+
+    bool parent_is_null = false;
+    char *next_hash = context_json_get_string_or_null(snapshot_json, "parentRoot", &parent_is_null);
+    free(current_hash);
+    current_hash = parent_is_null ? NULL : next_hash;
+    if (parent_is_null) free(next_hash);
+    free(snapshot_root);
+    free(filename_hash);
+    free(expected_root);
+    free(snapshot_json);
+    free(snapshot_path);
+  }
+
+  free(current_hash);
+  context_free_string_array(visited, visited_count);
+  state->parent_chain_ok = parent_chain_ok && state->current_root_snapshot_json != NULL;
+  free(root_path);
 }

@@ -16,6 +16,46 @@ char *context_event_hash(const char *event_json);
 char *context_node_lifecycle_state(const char *node_json);
 char *context_root_payload_hash(const char *root_snapshot_json);
 
+typedef struct {
+  char *severity;
+  char *code;
+  char *message;
+  char *node_id;
+  char *hash;
+  char *path;
+  char *expected;
+  char *actual;
+} ContextDiagnostic;
+
+void context_diagnostic_free(ContextDiagnostic *diagnostic);
+void context_diagnostic_append(
+  ZBuf *diagnostics,
+  size_t *diagnostic_count,
+  const char *severity,
+  const char *code,
+  const char *message,
+  const char *node_id,
+  const char *hash,
+  const char *path,
+  const char *expected,
+  const char *actual);
+
+typedef struct {
+  char *pointer_json;
+  char *current_root;
+  char *current_root_snapshot_json;
+  bool root_hash_ok;
+  bool parent_chain_ok;
+  size_t root_depth;
+} ContextComplianceRootState;
+
+void context_compliance_root_state_free(ContextComplianceRootState *state);
+void context_compliance_read_root(
+  const char *storage,
+  ContextComplianceRootState *state,
+  ZBuf *diagnostics,
+  size_t *diagnostic_count);
+
 bool context_json_get_int(const char *json, const char *name, int *out);
 char *context_json_get_string_or_null(const char *json, const char *name, bool *is_null);
 bool context_json_emit_field(ZBuf *buf, const char *json, const char *name);
