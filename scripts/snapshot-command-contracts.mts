@@ -2,7 +2,8 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 if (process.env.ZERO_NATIVE_TEST_SANDBOX !== "1" && process.env.ZERO_NATIVE_TEST_ALLOW_LOCAL !== "1") {
@@ -13,9 +14,10 @@ if (process.env.ZERO_NATIVE_TEST_SANDBOX !== "1" && process.env.ZERO_NATIVE_TEST
 const outDir = ".zero/command-contracts";
 mkdirSync(outDir, { recursive: true });
 
-function zero(args, options: { allowFailure?: boolean } = {}) {
+function zero(args, options: { allowFailure?: boolean; env?: NodeJS.ProcessEnv } = {}) {
+  const env = options.env ? { ...process.env, ...options.env } : process.env;
   try {
-    const stdout = execFileSync("bin/zero", args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+    const stdout = execFileSync("bin/zero", args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], env });
     return { code: 0, stdout };
   } catch (error) {
     if (!options.allowFailure) throw error;
@@ -27,7 +29,7 @@ function zero(args, options: { allowFailure?: boolean } = {}) {
   }
 }
 
-function json(args, options = {}) {
+function json(args, options: { allowFailure?: boolean; env?: NodeJS.ProcessEnv } = {}) {
   const result = zero(args, options);
   return { ...result, body: JSON.parse(result.stdout) };
 }
@@ -234,8 +236,92 @@ for (const [command, expected] of [
   [["size", "--help"], /Usage: zero size/],
   [["explain", "--help"], /Usage: zero explain/],
   [["fix", "--help"], /Usage: zero fix/],
+  [["context", "--help"], /Usage: zero context/],
 ] as Array<[string[], RegExp]>) {
   assert.match(zero(command).stdout, expected);
+}
+
+{
+  const tmpDir = mkdtempSync(join(tmpdir(), "zero-ctx-missing-"));
+  try {
+    const result = json(["context", "status", "--json"], { env: { ZERO_CONTEXT_DIR: join(tmpDir, "nonexistent") } });
+    assert.equal(result.body.schemaVersion, 1);
+    assert.equal(result.body.mode, "context-status");
+    assert.equal(result.body.storageSchemaVersion, 1);
+    assert.equal(result.body.storageExists, false);
+    assert.equal(result.body.rootPointerExists, false);
+    assert.equal(result.body.rootPointerSchemaVersion, null);
+    assert.equal(result.body.currentRoot, null);
+    assert.equal(result.body.previousRoot, null);
+    assert.equal(result.body.rootPath, null);
+    assert.equal(result.body.currentRootSnapshotExists, false);
+    assert.equal(result.body.currentRootSnapshotSchemaVersion, null);
+    assert.equal(result.body.sourceIndexExists, false);
+    assert.equal(result.body.nativeContextSupport, "experimental");
+    assert.equal(result.body.diagnostics.length, 1);
+    assert.equal(result.body.diagnostics[0].code, "CTX_CONTEXT_STORAGE_MISSING");
+    assert.equal(result.body.diagnostics[0].severity, "warning");
+    assert.equal(result.code, 0);
+  } finally {
+    rmSync(tmpDir, { recursive: true, force: true });
+  }
+}
+
+{
+  const ctxDir = join(outDir, "context-status-fixture");
+  const rootHash = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+  const rootFile = join(ctxDir, "root.json");
+  const rootSnapshotFile = join(ctxDir, "roots", `${rootHash.replace("sha256:", "")}.json`);
+  const sourceIndexFile = join(ctxDir, "indexes", "source-index.json");
+  rmSync(ctxDir, { recursive: true, force: true });
+  mkdirSync(join(ctxDir, "roots"), { recursive: true });
+  mkdirSync(join(ctxDir, "indexes"), { recursive: true });
+  writeFileSync(rootFile, `${JSON.stringify({
+    schemaVersion: 1,
+    currentRoot: rootHash,
+    previousRoot: null,
+    rootPath: rootSnapshotFile,
+    indexes: {
+      sourceIndex: sourceIndexFile,
+    },
+  }, null, 2)}\n`);
+  writeFileSync(rootSnapshotFile, `${JSON.stringify({
+    schemaVersion: 1,
+    contextRoot: rootHash,
+    parentRoot: null,
+    reason: "init",
+    activeNodes: [],
+    supersededNodes: [],
+    archivedNodes: [],
+    nodes: [],
+    createdAt: null,
+    indexes: {
+      sourceIndex: sourceIndexFile,
+    },
+  }, null, 2)}\n`);
+  writeFileSync(sourceIndexFile, `${JSON.stringify({ schemaVersion: 1, sources: {} }, null, 2)}\n`);
+  try {
+    const result = json(["context", "status", "--json"], { env: { ZERO_CONTEXT_DIR: ctxDir } });
+    assert.equal(result.body.schemaVersion, 1);
+    assert.equal(result.body.mode, "context-status");
+    assert.equal(result.body.storageSchemaVersion, 1);
+    assert.equal(result.body.storage, ctxDir);
+    assert.equal(result.body.storageExists, true);
+    assert.equal(result.body.rootPointerExists, true);
+    assert.equal(result.body.rootPointerSchemaVersion, 1);
+    assert.equal(result.body.currentRoot, rootHash);
+    assert.equal(result.body.previousRoot, null);
+    assert.equal(result.body.rootPath, rootSnapshotFile);
+    assert.equal(result.body.currentRootSnapshotExists, true);
+    assert.equal(result.body.currentRootSnapshotSchemaVersion, 1);
+    assert.equal(result.body.sourceIndexPath, sourceIndexFile);
+    assert.equal(result.body.sourceIndexExists, true);
+    assert.equal(result.body.nativeContextSupport, "experimental");
+    assert.deepEqual(result.body.diagnostics, []);
+    assert.equal(result.code, 0);
+  } finally {
+    rmSync(ctxDir, { recursive: true, force: true });
+  }
 }
 
 const skillsList = json(["skills", "list", "--json"]).body;

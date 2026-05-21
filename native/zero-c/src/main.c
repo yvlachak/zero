@@ -75,6 +75,7 @@ typedef struct {
 } ShipArtifacts;
 
 static void print_command_help(const char *command);
+static int context_status_command(const Command *command);
 
 static const char *diag_code(int code) {
   switch (code) {
@@ -657,6 +658,16 @@ static char *command_first_line(const char *command) {
 static bool path_exists(const char *path) {
   struct stat st;
   return stat(path, &st) == 0;
+}
+
+static bool dir_exists(const char *path) {
+  struct stat st;
+  return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
+}
+
+static const char *context_storage_dir(void) {
+  const char *override = getenv("ZERO_CONTEXT_DIR");
+  return override && override[0] ? override : ".zero/context";
 }
 
 static int zero_mkdir(const char *path) {
@@ -3346,6 +3357,7 @@ static void print_help(void) {
   printf("  zero abi check|dump [--json] [--target <target>] <file.0|project|zero.json>\n");
   printf("  zero explain [--json] <code>\n");
   printf("  zero fix --plan --json <file.0|project|zero.json>\n");
+  printf("  zero context <subcommand> [--json]\n");
   printf("  zero doctor [--json]\n");
   printf("  zero clean [--all]\n");
   printf("  zero targets\n");
@@ -3438,6 +3450,11 @@ static void print_command_help(const char *command) {
   } else if (strcmp(command, "fix") == 0) {
     printf("Usage: zero fix (--plan|--patch|--apply) --json [--target <target>] <file.0|project|zero.json>\n\n");
     printf("Print repair plans, reviewable patches, or apply behavior-preserving edits.\n");
+  } else if (strcmp(command, "context") == 0) {
+    printf("Usage: zero context <subcommand> [--json]\n\n");
+    printf("Subcommands:\n");
+    printf("  status    Report semantic context storage status\n");
+    printf("  help      Show this help\n");
   } else if (strcmp(command, "version") == 0 || strcmp(command, "--version") == 0) {
     printf("Usage: zero --version [--json]\n\n");
     printf("Print version, commit, host target, compiler backend, and target toolchain availability.\n");
@@ -3550,6 +3567,17 @@ static bool parse_command(int argc, char **argv, Command *command) {
     }
     return true;
   }
+  if (strcmp(command->command, "context") == 0) {
+    command->kind = "status";
+    for (int i = 2; i < argc; i++) {
+      if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) command->kind = "help";
+      else if (strcmp(argv[i], "--json") == 0) command->json = true;
+      else if (strcmp(argv[i], "help") == 0) command->kind = "help";
+      else if (!command->kind || strcmp(command->kind, "status") == 0) command->kind = argv[i];
+      else command->unknown_flag = argv[i];
+    }
+    return true;
+  }
   int arg_start = 2;
   if (strcmp(command->command, "abi") == 0 && argc >= 3 && strncmp(argv[2], "--", 2) != 0) {
     command->kind = argv[2];
@@ -3582,6 +3610,7 @@ static bool parse_command(int argc, char **argv, Command *command) {
   return strcmp(command->command, "--version") == 0 ||
          strcmp(command->command, "version") == 0 ||
          strcmp(command->command, "skills") == 0 ||
+         strcmp(command->command, "context") == 0 ||
          strcmp(command->command, "check") == 0 ||
          strcmp(command->command, "test") == 0 ||
          strcmp(command->command, "fmt") == 0 ||
@@ -8982,6 +9011,235 @@ static void append_graph_json(ZBuf *buf, const SourceInput *input, const Program
   zbuf_append(buf, "\n}\n");
 }
 
+static const char *context_json_skip_ws(const char *cursor) {
+  while (cursor && (*cursor == ' ' || *cursor == '\n' || *cursor == '\r' || *cursor == '\t')) cursor++;
+  return cursor;
+}
+
+static const char *context_json_member_value(const char *json, const char *name) {
+  if (!json || !name) return NULL;
+  char key[128];
+  snprintf(key, sizeof(key), "\"%s\"", name);
+  const char *cursor = strstr(json, key);
+  if (!cursor) return NULL;
+  cursor += strlen(key);
+  cursor = context_json_skip_ws(cursor);
+  if (!cursor || *cursor != ':') return NULL;
+  return context_json_skip_ws(cursor + 1);
+}
+
+static bool context_json_get_int(const char *json, const char *name, int *out) {
+  const char *cursor = context_json_member_value(json, name);
+  if (!cursor || !isdigit((unsigned char)*cursor)) return false;
+  char *end = NULL;
+  long value = strtol(cursor, &end, 10);
+  if (!end || end == cursor) return false;
+  *out = (int)value;
+  return true;
+}
+
+static char *context_json_get_string_or_null(const char *json, const char *name, bool *is_null) {
+  if (is_null) *is_null = false;
+  const char *cursor = context_json_member_value(json, name);
+  if (!cursor) return NULL;
+  if (strncmp(cursor, "null", 4) == 0) {
+    if (is_null) *is_null = true;
+    return NULL;
+  }
+  if (*cursor != '"') return NULL;
+  cursor++;
+  ZBuf value;
+  zbuf_init(&value);
+  while (*cursor) {
+    if (*cursor == '"') return value.data ? value.data : z_strdup("");
+    if (*cursor == '\\' && cursor[1]) {
+      cursor++;
+      if (*cursor == 'n') zbuf_append_char(&value, '\n');
+      else if (*cursor == 'r') zbuf_append_char(&value, '\r');
+      else if (*cursor == 't') zbuf_append_char(&value, '\t');
+      else zbuf_append_char(&value, *cursor);
+      cursor++;
+      continue;
+    }
+    zbuf_append_char(&value, *cursor++);
+  }
+  zbuf_free(&value);
+  return NULL;
+}
+
+static char *context_root_snapshot_path(const char *storage, const char *current_root) {
+  if (!storage || !current_root) return NULL;
+  const char *hash = strncmp(current_root, "sha256:", 7) == 0 ? current_root + 7 : current_root;
+  char *roots = join_cli_path(storage, "roots");
+  char *file = NULL;
+  if (roots) {
+    ZBuf filename;
+    zbuf_init(&filename);
+    zbuf_append(&filename, hash);
+    zbuf_append(&filename, ".json");
+    file = join_cli_path(roots, filename.data);
+    zbuf_free(&filename);
+  }
+  free(roots);
+  return file;
+}
+
+static void append_context_status_json(
+  ZBuf *buf,
+  const char *storage,
+  bool storage_exists,
+  bool root_pointer_exists,
+  int root_pointer_schema_version,
+  const char *current_root,
+  const char *previous_root,
+  const char *root_path_value,
+  bool current_root_snapshot_exists,
+  int current_root_snapshot_schema_version,
+  const char *source_index_path,
+  bool source_index_exists,
+  const char *diagnostic_code,
+  const char *diagnostic_message,
+  const char *diagnostic_path
+) {
+  zbuf_append(buf, "{\n  \"schemaVersion\": 1,\n  \"mode\": \"context-status\",\n  \"storageSchemaVersion\": 1,\n  \"storage\": ");
+  append_json_string(buf, storage);
+  zbuf_appendf(buf, ",\n  \"storageExists\": %s,\n  \"rootPointerExists\": %s,\n  \"rootPointerSchemaVersion\": ",
+    storage_exists ? "true" : "false",
+    root_pointer_exists ? "true" : "false");
+  if (root_pointer_schema_version > 0) zbuf_appendf(buf, "%d", root_pointer_schema_version);
+  else zbuf_append(buf, "null");
+  zbuf_append(buf, ",\n  \"currentRoot\": ");
+  append_json_string_or_null(buf, current_root);
+  zbuf_append(buf, ",\n  \"previousRoot\": ");
+  append_json_string_or_null(buf, previous_root);
+  zbuf_append(buf, ",\n  \"rootPath\": ");
+  append_json_string_or_null(buf, root_path_value);
+  zbuf_appendf(buf, ",\n  \"currentRootSnapshotExists\": %s,\n  \"currentRootSnapshotSchemaVersion\": ",
+    current_root_snapshot_exists ? "true" : "false");
+  if (current_root_snapshot_schema_version > 0) zbuf_appendf(buf, "%d", current_root_snapshot_schema_version);
+  else zbuf_append(buf, "null");
+  zbuf_append(buf, ",\n  \"sourceIndexPath\": ");
+  append_json_string(buf, source_index_path);
+  zbuf_appendf(buf, ",\n  \"sourceIndexExists\": %s,\n  \"nativeContextSupport\": \"experimental\",\n  \"diagnostics\": ",
+    source_index_exists ? "true" : "false");
+  if (diagnostic_code) {
+    zbuf_append(buf, "[\n    {\"code\": ");
+    append_json_string(buf, diagnostic_code);
+    zbuf_append(buf, ", \"severity\": \"warning\", \"message\": ");
+    append_json_string(buf, diagnostic_message);
+    zbuf_append(buf, ", \"path\": ");
+    append_json_string(buf, diagnostic_path);
+    zbuf_append(buf, "}\n  ]");
+  } else {
+    zbuf_append(buf, "[]");
+  }
+  zbuf_append(buf, "\n}\n");
+}
+
+static int context_status_command(const Command *command) {
+  const char *storage = context_storage_dir();
+  bool storage_exists = dir_exists(storage);
+  char *root_file = join_cli_path(storage, "root.json");
+  char *indexes_dir = join_cli_path(storage, "indexes");
+  char *source_index_path = join_cli_path(indexes_dir, "source-index.json");
+  bool source_index_exists = path_exists(source_index_path);
+  bool root_pointer_exists = false;
+  int root_pointer_schema_version = 0;
+  char *current_root = NULL;
+  char *previous_root = NULL;
+  char *root_path_value = NULL;
+  bool current_root_snapshot_exists = false;
+  int current_root_snapshot_schema_version = 0;
+  const char *diagnostic_code = NULL;
+  const char *diagnostic_message = NULL;
+  const char *diagnostic_path = NULL;
+
+  if (!storage_exists) {
+    diagnostic_code = "CTX_CONTEXT_STORAGE_MISSING";
+    diagnostic_message = "semantic context storage does not exist";
+    diagnostic_path = storage;
+  } else if (!path_exists(root_file)) {
+    diagnostic_code = "CTX_ROOT_POINTER_MISSING";
+    diagnostic_message = "semantic context root pointer does not exist";
+    diagnostic_path = root_file;
+  } else {
+    ZDiag read_diag = {0};
+    char *root_json = z_read_file(root_file, &read_diag);
+    bool previous_is_null = false;
+    if (root_json &&
+        context_json_get_int(root_json, "schemaVersion", &root_pointer_schema_version) &&
+        (current_root = context_json_get_string_or_null(root_json, "currentRoot", NULL)) != NULL &&
+        (root_path_value = context_json_get_string_or_null(root_json, "rootPath", NULL)) != NULL) {
+      previous_root = context_json_get_string_or_null(root_json, "previousRoot", &previous_is_null);
+      if (!previous_root && !previous_is_null) {
+        diagnostic_code = "CTX_ROOT_POINTER_MALFORMED";
+        diagnostic_message = "semantic context root pointer is malformed";
+        diagnostic_path = root_file;
+      } else {
+        root_pointer_exists = true;
+        char *snapshot_path = context_root_snapshot_path(storage, current_root);
+        current_root_snapshot_exists = snapshot_path && path_exists(snapshot_path);
+        if (current_root_snapshot_exists) {
+          ZDiag snapshot_diag = {0};
+          char *snapshot_json = z_read_file(snapshot_path, &snapshot_diag);
+          if (snapshot_json) {
+            context_json_get_int(snapshot_json, "schemaVersion", &current_root_snapshot_schema_version);
+            free(snapshot_json);
+          }
+        }
+        free(snapshot_path);
+      }
+    } else {
+      diagnostic_code = "CTX_ROOT_POINTER_MALFORMED";
+      diagnostic_message = "semantic context root pointer is malformed";
+      diagnostic_path = root_file;
+    }
+    free(root_json);
+  }
+
+  if (command && command->json) {
+    ZBuf buf;
+    zbuf_init(&buf);
+    append_context_status_json(
+      &buf,
+      storage,
+      storage_exists,
+      root_pointer_exists,
+      root_pointer_schema_version,
+      root_pointer_exists ? current_root : NULL,
+      root_pointer_exists ? previous_root : NULL,
+      root_pointer_exists ? root_path_value : NULL,
+      current_root_snapshot_exists,
+      current_root_snapshot_schema_version,
+      source_index_path,
+      source_index_exists,
+      diagnostic_code,
+      diagnostic_message,
+      diagnostic_path
+    );
+    fputs(buf.data, stdout);
+    zbuf_free(&buf);
+  } else {
+    printf("semantic context storage: %s\n", storage);
+    printf("storage: %s\n", storage_exists ? "present" : "missing");
+    if (root_pointer_exists) {
+      printf("current root: %s\n", current_root);
+      printf("root snapshot: %s\n", current_root_snapshot_exists ? "present" : "missing");
+      printf("source index: %s\n", source_index_exists ? "present" : "missing");
+    } else if (diagnostic_message) {
+      printf("status: %s\n", diagnostic_message);
+    }
+  }
+
+  free(root_file);
+  free(indexes_dir);
+  free(source_index_path);
+  free(current_root);
+  free(previous_root);
+  free(root_path_value);
+  return 0;
+}
+
 int main(int argc, char **argv) {
   if (argc >= 2 && (strcmp(argv[1], "--help") == 0 || strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "help") == 0)) {
     print_help();
@@ -9039,6 +9297,17 @@ int main(int argc, char **argv) {
   }
   if (strcmp(command.command, "skills") == 0) {
     return embedded_skills_command(argc, argv, command.json);
+  }
+  if (strcmp(command.command, "context") == 0) {
+    if (command.kind && strcmp(command.kind, "help") == 0) {
+      print_command_help("context");
+      return 0;
+    }
+    if (command.kind && strcmp(command.kind, "status") == 0) {
+      return context_status_command(&command);
+    }
+    print_command_help("context");
+    return 1;
   }
   if (!command.input) {
     print_command_help(command.command);
