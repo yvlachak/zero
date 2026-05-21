@@ -204,6 +204,22 @@ type ContextEventSummary = {
   rootChanged: boolean;
 };
 
+type TimelineEvent = {
+  eventId: string;
+  eventHash: string;
+  eventHashOk: boolean;
+  mode: ContextEvent["mode"];
+  sourceFile: string;
+  previousRoot: string;
+  previousRootExists: boolean;
+  currentRoot: string;
+  currentRootExists: boolean;
+  rootChanged: boolean;
+  captured: ContextEvent["captured"];
+  skipped: SkippedFixPlanNode[];
+  verification: ContextEvent["verification"];
+};
+
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(scriptDir, "..");
 function displayPath(filePath: string) {
@@ -245,6 +261,7 @@ function usage(): never {
   semantic-context verify --json [--include-superseded]
   semantic-context check-cycle --source <file> --json
   semantic-context events --json
+  semantic-context timeline [--source <file>] --json
   semantic-context diff --from <context-dir-or-root-snapshot> --to <context-dir-or-root-snapshot> --json`);
   process.exit(1);
 }
@@ -1387,6 +1404,131 @@ function commandEvents() {
   if (diagnostics.length > 0) process.exitCode = 1;
 }
 
+function rootExists(hash: string) {
+  return existsSync(rootSnapshotPath(hash));
+}
+
+function malformedTimelineEvent(diagnostics: Diagnostic[], message: string, pathName: string) {
+  pushDiagnostic(diagnostics, {
+    code: "CTX_TIMELINE_EVENT_MALFORMED",
+    message,
+    path: pathName,
+  });
+}
+
+function isContextEvent(value: unknown): value is ContextEvent {
+  return (
+    isObject(value) &&
+    value.schemaVersion === 1 &&
+    value.kind === "context-event" &&
+    typeof value.eventId === "string" &&
+    typeof value.eventHash === "string" &&
+    value.mode === "context-check-cycle" &&
+    typeof value.sourceFile === "string" &&
+    typeof value.previousRoot === "string" &&
+    typeof value.currentRoot === "string" &&
+    typeof value.rootChanged === "boolean" &&
+    Array.isArray(value.captured) &&
+    Array.isArray(value.skipped) &&
+    isObject(value.verification) &&
+    typeof value.verification.ok === "boolean" &&
+    typeof value.verification.checkedNodes === "number" &&
+    Array.isArray(value.diagnostics)
+  );
+}
+
+function readTimelineEvents(diagnostics: Diagnostic[]) {
+  const events: Array<{ event: ContextEvent; eventHashOk: boolean }> = [];
+  for (const filename of eventFilenames()) {
+    const filePath = path.join(eventsDir, filename);
+    const display = displayPath(filePath);
+    let value: unknown;
+    try {
+      value = readJson<unknown>(filePath);
+    } catch (error) {
+      malformedTimelineEvent(diagnostics, error instanceof Error ? error.message : "context event is not valid JSON", display);
+      continue;
+    }
+    if (!isContextEvent(value)) {
+      malformedTimelineEvent(diagnostics, "context event has an unsupported schema", display);
+      continue;
+    }
+    const actualHash = contextEventHash(value);
+    const eventHashOk = value.eventHash === actualHash;
+    if (!eventHashOk) {
+      pushDiagnostic(diagnostics, {
+        code: "CTX_TIMELINE_EVENT_HASH_MISMATCH",
+        message: "context event hash does not match canonical payload",
+        path: display,
+        expected: value.eventHash,
+        actual: actualHash,
+      });
+    }
+    events.push({ event: value, eventHashOk });
+  }
+  return events.sort((left, right) => left.event.eventId.localeCompare(right.event.eventId));
+}
+
+function timelineForEvent(event: ContextEvent, eventHashOk: boolean, diagnostics: Diagnostic[]): TimelineEvent {
+  const previousRootExists = rootExists(event.previousRoot);
+  const currentRootExists = rootExists(event.currentRoot);
+  if (!previousRootExists) {
+    pushDiagnostic(diagnostics, {
+      code: "CTX_TIMELINE_ROOT_MISSING",
+      message: "timeline event references a missing previous root",
+      hash: event.previousRoot,
+      path: displayPath(rootSnapshotPath(event.previousRoot)),
+    });
+  }
+  if (!currentRootExists) {
+    pushDiagnostic(diagnostics, {
+      code: "CTX_TIMELINE_ROOT_MISSING",
+      message: "timeline event references a missing current root",
+      hash: event.currentRoot,
+      path: displayPath(rootSnapshotPath(event.currentRoot)),
+    });
+  }
+  return {
+    eventId: event.eventId,
+    eventHash: event.eventHash,
+    eventHashOk,
+    mode: event.mode,
+    sourceFile: event.sourceFile,
+    previousRoot: event.previousRoot,
+    previousRootExists,
+    currentRoot: event.currentRoot,
+    currentRootExists,
+    rootChanged: event.rootChanged,
+    captured: event.captured,
+    skipped: event.skipped,
+    verification: event.verification,
+  };
+}
+
+function commandTimeline(sourceOption: string | boolean | undefined) {
+  ensureLayout();
+  const source = typeof sourceOption === "string" ? repoRelative(sourceOption) : null;
+  const diagnostics: Diagnostic[] = [];
+  const events = readTimelineEvents(diagnostics)
+    .filter(({ event }) => source === null || event.sourceFile === source)
+    .map(({ event, eventHashOk }) => timelineForEvent(event, eventHashOk, diagnostics));
+  const missingRoots = events.reduce((count, event) => count + (event.previousRootExists ? 0 : 1) + (event.currentRootExists ? 0 : 1), 0);
+  console.log(JSON.stringify({
+    schemaVersion: 1,
+    mode: "context-timeline",
+    sourceFile: source,
+    events,
+    summary: {
+      events: events.length,
+      rootTransitions: events.filter((event) => event.rootChanged).length,
+      hashFailures: events.filter((event) => !event.eventHashOk).length,
+      missingRoots,
+    },
+    diagnostics,
+  }, null, 2));
+  if (diagnostics.length > 0) process.exitCode = 1;
+}
+
 function resolveContextInput(input: string) {
   if (input.startsWith("sha256:")) {
     return {
@@ -1630,6 +1772,7 @@ export function main(argv = process.argv.slice(2)) {
   else if (command === "verify") commandVerify(options.includeSuperseded);
   else if (command === "check-cycle") commandCheckCycle(options.source);
   else if (command === "events") commandEvents();
+  else if (command === "timeline") commandTimeline(options.source);
   else if (command === "diff") commandDiff(options.from, options.to);
   else usage();
 }

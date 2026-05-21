@@ -324,6 +324,63 @@ try {
     event.rootChanged === false
   ));
 
+  const sourceTimeline = run(["timeline", "--source", source, "--json"]);
+  assert.equal(sourceTimeline.schemaVersion, 1);
+  assert.equal(sourceTimeline.mode, "context-timeline");
+  assert.equal(sourceTimeline.sourceFile, source);
+  assert.equal(sourceTimeline.events.length, 2);
+  assert.equal(sourceTimeline.summary.events, 2);
+  assert.equal(sourceTimeline.summary.rootTransitions, 1);
+  assert.equal(sourceTimeline.summary.hashFailures, 0);
+  assert.equal(sourceTimeline.summary.missingRoots, 0);
+  assert.deepEqual(sourceTimeline.diagnostics, []);
+  assert.equal(sourceTimeline.events[0].eventId, checkCycleEvent.eventId);
+  assert.equal(sourceTimeline.events[0].eventHash, checkCycle.event.eventHash);
+  assert.equal(sourceTimeline.events[0].eventHashOk, true);
+  assert.equal(sourceTimeline.events[0].previousRootExists, true);
+  assert.equal(sourceTimeline.events[0].currentRootExists, true);
+  assert.equal(sourceTimeline.events[0].rootChanged, true);
+  assert.deepEqual(sourceTimeline.events[0].captured, checkCycleEvent.captured);
+  assert.deepEqual(sourceTimeline.events[0].verification, { ok: true, checkedNodes: 1 });
+  assert.equal(sourceTimeline.events[1].eventHash, repeatedCycle.event.eventHash);
+  assert.equal(sourceTimeline.events[1].eventHashOk, true);
+  assert.equal(sourceTimeline.events[1].rootChanged, false);
+  assert.equal(sourceTimeline.events[1].previousRootExists, true);
+  assert.equal(sourceTimeline.events[1].currentRootExists, true);
+
+  const allTimeline = run(["timeline", "--json"]);
+  assert.equal(allTimeline.mode, "context-timeline");
+  assert.equal(allTimeline.sourceFile, null);
+  assert.equal(allTimeline.events.length, 2);
+  assert.deepEqual(allTimeline.diagnostics, []);
+
+  const tamperedEvent = {
+    ...checkCycleEvent,
+    rootChanged: false,
+  };
+  writeFileSync(eventPath(storage, checkCycle.event.eventHash), `${JSON.stringify(tamperedEvent, null, 2)}\n`);
+  rmSync(snapshotPath(storage, repeatedCycle.rootTransition.currentRoot), { force: true });
+  const tamperedTimeline = run(["timeline", "--source", source, "--json"], { allowFailure: true });
+  assert.equal(tamperedTimeline.events.length, 2);
+  assert(tamperedTimeline.events.some((event: any) =>
+    event.eventHash === checkCycle.event.eventHash &&
+    event.eventHashOk === false
+  ));
+  assert(tamperedTimeline.events.some((event: any) =>
+    event.eventHash === repeatedCycle.event.eventHash &&
+    event.currentRootExists === false
+  ));
+  assert(tamperedTimeline.summary.hashFailures >= 1);
+  assert(tamperedTimeline.summary.missingRoots >= 1);
+  assert(tamperedTimeline.diagnostics.some((diagnostic: any) =>
+    diagnostic.code === "CTX_TIMELINE_EVENT_HASH_MISMATCH" &&
+    diagnostic.severity === "error"
+  ));
+  assert(tamperedTimeline.diagnostics.some((diagnostic: any) =>
+    diagnostic.code === "CTX_TIMELINE_ROOT_MISSING" &&
+    diagnostic.severity === "error"
+  ));
+
   resetStorage();
   const previewPlan = tempJson("preview-plan.json", {
     schemaVersion: 1,
