@@ -130,6 +130,12 @@ static int zero_mkdir(const char *path) {
 }
 
 char *z_read_file(const char *path, ZDiag *diag) {
+  size_t len = 0;
+  return z_read_file_bytes(path, &len, diag);
+}
+
+char *z_read_file_bytes(const char *path, size_t *out_len, ZDiag *diag) {
+  if (out_len) *out_len = 0;
   FILE *file = fopen(path, "rb");
   if (!file) {
     diag_io(diag, path, "read");
@@ -147,6 +153,7 @@ char *z_read_file(const char *path, ZDiag *diag) {
   size_t read = fread(data, 1, (size_t)size, file);
   fclose(file);
   data[read] = 0;
+  if (out_len) *out_len = read;
   return data;
 }
 

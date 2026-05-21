@@ -13,8 +13,13 @@ bool context_json_get_int(const char *json, const char *name, int *out);
 char *context_json_get_string_or_null(const char *json, const char *name, bool *is_null);
 bool context_json_emit_field(ZBuf *buf, const char *json, const char *name);
 char *context_json_get_nested_string(const char *json, const char *outer, const char *inner, bool *is_null);
+bool context_json_canonicalize(ZBuf *out, const char *json);
+bool context_json_canonicalize_excluding(ZBuf *out, const char *json, const char *const *excluded_keys);
 
 char **context_source_index_hashes(const char *storage, const char *source_path, size_t *count);
 char *context_read_node(const char *storage, const char *hash);
+char *context_read_root_snapshot(const char *storage, const char *current_root);
+char **context_root_active_hashes(const char *root_snapshot_json, size_t *out_count);
+char **context_root_all_hashes(const char *root_snapshot_json, size_t *out_count);
 
 #endif

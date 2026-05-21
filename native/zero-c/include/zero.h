@@ -775,6 +775,7 @@ size_t z_grow_capacity(size_t current, size_t required, size_t initial);
 char *z_strdup(const char *text);
 char *z_strndup(const char *text, size_t len);
 char *z_read_file(const char *path, ZDiag *diag);
+char *z_read_file_bytes(const char *path, size_t *out_len, ZDiag *diag);
 bool z_write_file(const char *path, const char *text, ZDiag *diag);
 bool z_write_binary_file(const char *path, const unsigned char *data, size_t len, ZDiag *diag);
 bool z_resolve_source(const char *input, SourceInput *out, ZDiag *diag);
