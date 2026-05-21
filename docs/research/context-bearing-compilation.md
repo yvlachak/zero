@@ -6,13 +6,15 @@ The semantic substrate sidecar models how Zero can carry development context thr
 
 The substrate uses:
 
-- immutable semantic nodes
+- hash-addressed semantic node payloads
 - immutable root snapshots
 - immutable context events
 - append-only event timeline
 - movable current-root pointer
 - development-time compliance checks
 - context-root attestation boundary for future artifacts
+
+In the current sidecar, node content hashes exclude lifecycle metadata. Lifecycle state is stored on node files and checked against root membership by compliance.
 
 The current sidecar reads native command output and writes local context state. Native compiler execution remains unchanged.
 

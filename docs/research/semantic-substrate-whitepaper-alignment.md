@@ -4,6 +4,8 @@ The original Semantic Merkle Substrate v1 whitepaper frames a compiler-mediated 
 
 This page maps the v1 whitepaper concepts to the current implementation and identifies the next technical boundaries. It is a bridge between the original research framing and the current sidecar contracts.
 
+For the current implementation-grounded paper, see [Zero Semantic Merkle Substrate](./zero-semantic-merkle-substrate-whitepaper.md).
+
 ## Core Thesis
 
 Whitepaper thesis:

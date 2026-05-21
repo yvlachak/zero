@@ -28,7 +28,7 @@ Canonical JSON rules:
 - primitive values use JSON encoding
 - fields with `undefined` values are omitted
 
-Node hashes exclude the node `hash` field. Event hashes exclude the event `eventHash` field. Root hashes are computed from the canonical root snapshot payload without a `contextRoot` field.
+Node hashes exclude the node `hash` field and lifecycle metadata. Event hashes exclude the event `eventHash` field. Root hashes are computed from the canonical root snapshot payload without a `contextRoot` field.
 
 ## Root Pointer
 
@@ -125,6 +125,8 @@ Lifecycle states:
 - `active`: projected by default and indexed when source-anchored.
 - `superseded`: addressable old version with a successor in `supersededBy`.
 - `archived`: addressable retired version removed from active projection.
+
+Lifecycle state is stored on node files and excluded from the node content hash. The semantic payload hash stays stable when root membership changes a node from active to superseded or archived. Compliance verifies that lifecycle state agrees with root membership.
 
 ## Source Anchor
 

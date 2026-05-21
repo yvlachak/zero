@@ -12,6 +12,7 @@ This research branch implements the substrate as a local sidecar. Native compile
 - [Reconciliation](./semantic-substrate-reconciliation.md): drift detection, archive, refresh-anchor, supersede, root updates, and event records.
 - [Context-Bearing Compilation](./context-bearing-compilation.md): development-time context model, artifact attestation boundary, and native integration path.
 - [Whitepaper Alignment](./semantic-substrate-whitepaper-alignment.md): mapping from the broader Semantic Merkle Substrate thesis to this sidecar implementation.
+- [Current Whitepaper](./zero-semantic-merkle-substrate-whitepaper.md): implementation-grounded architecture paper for the current sidecar and native integration boundary.
 
 ## Implemented Capabilities
 
