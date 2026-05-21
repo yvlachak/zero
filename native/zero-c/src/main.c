@@ -3,6 +3,7 @@
 #endif
 
 #include "context.h"
+#include "hash.h"
 #include "zero.h"
 
 #include <ctype.h>
@@ -53,6 +54,7 @@ typedef struct {
   bool apply;
   bool patch;
   bool all;
+  bool include_superseded;
   bool fmt_check;
   bool legacy_backend;
   bool trace;
@@ -79,6 +81,7 @@ typedef struct {
 static void print_command_help(const char *command);
 static int context_status_command(const Command *command);
 static int context_project_command(const Command *command);
+static int context_verify_command(const Command *command);
 
 static const char *diag_code(int code) {
   switch (code) {
@@ -3453,6 +3456,7 @@ static void print_command_help(const char *command) {
     printf("Subcommands:\n");
     printf("  status    Report semantic context storage status\n");
     printf("  project   Project active semantic context for a source\n");
+    printf("  verify    Verify semantic context hashes and source anchors\n");
     printf("  help      Show this help\n");
   } else if (strcmp(command, "version") == 0 || strcmp(command, "--version") == 0) {
     printf("Usage: zero --version [--json]\n\n");
@@ -3575,6 +3579,7 @@ static bool parse_command(int argc, char **argv, Command *command) {
         if (i + 1 >= argc) command->unknown_flag = argv[i];
         else command->source = argv[++i];
       }
+      else if (strcmp(argv[i], "--include-superseded") == 0) command->include_superseded = true;
       else if (strcmp(argv[i], "help") == 0) command->kind = "help";
       else if (!command->kind || strcmp(command->kind, "status") == 0) command->kind = argv[i];
       else command->unknown_flag = argv[i];
@@ -9357,6 +9362,444 @@ static int context_project_command(const Command *command) {
   return 0;
 }
 
+static char *context_prefixed_sha256(const unsigned char *data, size_t len) {
+  unsigned char digest[Z_SHA256_DIGEST_LEN];
+  char hex[65];
+  z_sha256_hash(data, len, digest);
+  z_sha256_hex(digest, hex);
+  ZBuf out;
+  zbuf_init(&out);
+  zbuf_append(&out, "sha256:");
+  zbuf_append(&out, hex);
+  return out.data;
+}
+
+static char *context_hash_json_excluding(const char *json, const char *const *excluded_keys) {
+  ZBuf canonical;
+  zbuf_init(&canonical);
+  if (!context_json_canonicalize_excluding(&canonical, json, excluded_keys)) {
+    zbuf_free(&canonical);
+    return NULL;
+  }
+  char *hash = context_prefixed_sha256((const unsigned char *)canonical.data, canonical.len);
+  zbuf_free(&canonical);
+  return hash;
+}
+
+static void context_verify_append_diagnostic(ZBuf *buf, size_t *count, const char *code, const char *severity, const char *node_id, const char *message, const char *path, const char *hash, const char *expected, const char *actual) {
+  if ((*count)++ > 0) zbuf_append(buf, ",\n");
+  zbuf_append(buf, "    {\"severity\": ");
+  append_json_string(buf, severity ? severity : "error");
+  zbuf_append(buf, ", \"code\": ");
+  append_json_string(buf, code);
+  if (node_id) {
+    zbuf_append(buf, ", \"nodeId\": ");
+    append_json_string(buf, node_id);
+  }
+  zbuf_append(buf, ", \"message\": ");
+  append_json_string(buf, message);
+  if (path) {
+    zbuf_append(buf, ", \"path\": ");
+    append_json_string(buf, path);
+  }
+  if (hash) {
+    zbuf_append(buf, ", \"hash\": ");
+    append_json_string(buf, hash);
+  }
+  if (expected) {
+    zbuf_append(buf, ", \"expected\": ");
+    append_json_string(buf, expected);
+  }
+  if (actual) {
+    zbuf_append(buf, ", \"actual\": ");
+    append_json_string(buf, actual);
+  }
+  zbuf_append(buf, "}");
+}
+
+static void context_free_hashes(char **hashes, size_t count) {
+  for (size_t i = 0; i < count; i++) free(hashes[i]);
+  free(hashes);
+}
+
+static bool context_hash_list_contains(char **hashes, size_t count, const char *hash) {
+  for (size_t i = 0; i < count; i++) {
+    if (strcmp(hashes[i], hash) == 0) return true;
+  }
+  return false;
+}
+
+static void context_verify_append_len(ZBuf *buf, const char *text, size_t len) {
+  for (size_t i = 0; i < len; i++) zbuf_append_char(buf, text[i]);
+}
+
+static char *context_node_file_path(const char *storage, const char *hash) {
+  const char *bare_hash = strncmp(hash, "sha256:", 7) == 0 ? hash + 7 : hash;
+  char *nodes = join_cli_path(storage, "nodes");
+  ZBuf filename;
+  zbuf_init(&filename);
+  zbuf_append(&filename, bare_hash);
+  zbuf_append(&filename, ".json");
+  char *path = join_cli_path(nodes, filename.data);
+  free(nodes);
+  zbuf_free(&filename);
+  return path;
+}
+
+typedef struct {
+  int start_line;
+  int start_col;
+  int end_line;
+  int end_col;
+  char *column_unit;
+} ContextSourceRange;
+
+static bool context_read_source_range(const char *anchor_json, ContextSourceRange *range) {
+  memset(range, 0, sizeof(*range));
+  ZBuf range_json;
+  zbuf_init(&range_json);
+  if (!context_json_emit_field(&range_json, anchor_json, "range")) {
+    zbuf_free(&range_json);
+    return false;
+  }
+  bool ok = false;
+  ZBuf start;
+  ZBuf end;
+  zbuf_init(&start);
+  zbuf_init(&end);
+  if (context_json_emit_field(&start, range_json.data, "start") &&
+      context_json_emit_field(&end, range_json.data, "end")) {
+    ok = context_json_get_int(start.data, "line", &range->start_line) &&
+         context_json_get_int(start.data, "column", &range->start_col) &&
+         context_json_get_int(end.data, "line", &range->end_line) &&
+         context_json_get_int(end.data, "column", &range->end_col);
+  } else {
+    ok = context_json_get_int(range_json.data, "startLine", &range->start_line) &&
+         context_json_get_int(range_json.data, "startCol", &range->start_col) &&
+         context_json_get_int(range_json.data, "endLine", &range->end_line) &&
+         context_json_get_int(range_json.data, "endCol", &range->end_col);
+  }
+  range->column_unit = context_json_get_string_or_null(range_json.data, "columnUnit", NULL);
+  if (!range->column_unit) range->column_unit = z_strdup("utf8-byte");
+  zbuf_free(&start);
+  zbuf_free(&end);
+  zbuf_free(&range_json);
+  return ok;
+}
+
+static char *context_extract_range_text(const char *source, size_t source_len, const ContextSourceRange *range, char **actual) {
+  *actual = NULL;
+  if (!range->column_unit || strcmp(range->column_unit, "utf8-byte") != 0) {
+    *actual = z_strdup("unsupported columnUnit");
+    return NULL;
+  }
+  if (range->start_line != range->end_line) {
+    *actual = z_strdup("multi-line range");
+    return NULL;
+  }
+  if (range->start_line < 1 || range->start_col < 1 || range->end_col < range->start_col) {
+    *actual = z_strdup("invalid range coordinates");
+    return NULL;
+  }
+  int line = 1;
+  size_t line_start = 0;
+  size_t line_end = source_len;
+  bool found = false;
+  for (size_t i = 0; i <= source_len; i++) {
+    if (i == source_len || source[i] == '\n') {
+      if (line == range->start_line) {
+        line_end = i;
+        found = true;
+        break;
+      }
+      line++;
+      line_start = i + 1;
+    }
+  }
+  if (!found) {
+    *actual = z_strdup("line out of range");
+    return NULL;
+  }
+  size_t start = (size_t)(range->start_col - 1);
+  size_t end = (size_t)(range->end_col - 1);
+  size_t line_len = line_end - line_start;
+  if (start > line_len || end > line_len) {
+    *actual = z_strdup("column out of range");
+    return NULL;
+  }
+  return z_strndup(source + line_start + start, end - start);
+}
+
+static const char *context_json_find_key(const char *json, const char *key) {
+  if (!json || !key) return NULL;
+  ZBuf quoted;
+  zbuf_init(&quoted);
+  zbuf_append_char(&quoted, '"');
+  zbuf_append(&quoted, key);
+  zbuf_append_char(&quoted, '"');
+  const char *cursor = strstr(json, quoted.data);
+  zbuf_free(&quoted);
+  return cursor;
+}
+
+static void context_verify_preconditions(const char *node_json, const char *node_id, const char *source_path, const char *extracted_text, ZBuf *preconditions, ZBuf *diagnostics, size_t *diagnostic_count) {
+  ZBuf projection;
+  ZBuf frontier;
+  ZBuf edits;
+  zbuf_init(&projection);
+  zbuf_init(&frontier);
+  zbuf_init(&edits);
+  zbuf_append_char(preconditions, '[');
+  size_t count = 0;
+  if (context_json_emit_field(&projection, node_json, "projection") &&
+      context_json_emit_field(&frontier, projection.data, "frontier") &&
+      context_json_emit_field(&edits, frontier.data, "edits")) {
+    const char *cursor = edits.data;
+    while ((cursor = context_json_find_key(cursor, "precondition")) != NULL) {
+      ZBuf precondition;
+      zbuf_init(&precondition);
+      if (!context_json_emit_field(&precondition, cursor, "precondition")) {
+        zbuf_free(&precondition);
+        cursor++;
+        continue;
+      }
+      char *kind = context_json_get_string_or_null(precondition.data, "kind", NULL);
+      char *expected = context_json_get_string_or_null(precondition.data, "text", NULL);
+      if (kind && strcmp(kind, "exact-text") == 0 && expected) {
+        bool ok = extracted_text && strcmp(extracted_text, expected) == 0;
+        if (count++ > 0) zbuf_append(preconditions, ", ");
+        zbuf_append(preconditions, "{\"kind\": \"exact-text\", \"ok\": ");
+        zbuf_append(preconditions, ok ? "true" : "false");
+        zbuf_append(preconditions, ", \"expected\": ");
+        append_json_string(preconditions, expected);
+        zbuf_append(preconditions, ", \"actual\": ");
+        append_json_string_or_null(preconditions, extracted_text);
+        zbuf_append(preconditions, "}");
+        if (!ok) {
+          context_verify_append_diagnostic(diagnostics, diagnostic_count, "CTX_PRECONDITION_MISMATCH", "error", node_id, "source anchor text does not satisfy exact-text precondition", source_path, NULL, expected, extracted_text);
+        }
+      }
+      free(kind);
+      free(expected);
+      zbuf_free(&precondition);
+      cursor++;
+    }
+  }
+  zbuf_append_char(preconditions, ']');
+  zbuf_free(&projection);
+  zbuf_free(&frontier);
+  zbuf_free(&edits);
+}
+
+static void context_verify_append_node_result(ZBuf *nodes, size_t *node_count, const char *hash, const char *node_id, const char *lifecycle_json, const char *anchor_path, const char *anchor_status, const char *current_source_hash, const char *preconditions_json) {
+  if ((*node_count)++ > 0) zbuf_append(nodes, ",\n");
+  zbuf_append(nodes, "    {\n      \"hash\": ");
+  append_json_string(nodes, hash);
+  zbuf_append(nodes, ",\n      \"nodeId\": ");
+  append_json_string(nodes, node_id);
+  zbuf_append(nodes, ",\n      \"lifecycle\": ");
+  zbuf_append(nodes, lifecycle_json ? lifecycle_json : "{\"state\":\"active\",\"supersedes\":[],\"supersededBy\":null}");
+  zbuf_append(nodes, ",\n      \"sourceAnchor\": {\n        \"path\": ");
+  append_json_string_or_null(nodes, anchor_path);
+  zbuf_append(nodes, ",\n        \"status\": ");
+  append_json_string(nodes, anchor_status ? anchor_status : "none");
+  zbuf_append(nodes, ",\n        \"currentSourceHash\": ");
+  append_json_string_or_null(nodes, current_source_hash);
+  zbuf_append(nodes, "\n      },\n      \"preconditions\": ");
+  zbuf_append(nodes, preconditions_json ? preconditions_json : "[]");
+  zbuf_append(nodes, "\n    }");
+}
+
+static int context_verify_emit_empty(const char *code, const char *severity, const char *message, const char *path, int exit_code) {
+  ZBuf diagnostics;
+  zbuf_init(&diagnostics);
+  size_t diagnostic_count = 0;
+  context_verify_append_diagnostic(&diagnostics, &diagnostic_count, code, severity, NULL, message, path, NULL, NULL, NULL);
+  printf("{\n  \"schemaVersion\": 1,\n  \"mode\": \"context-verify\",\n  \"ok\": false,\n  \"checkedNodes\": 0,\n  \"nodes\": [],\n  \"diagnostics\": [\n");
+  fputs(diagnostics.data ? diagnostics.data : "", stdout);
+  printf("\n  ]\n}\n");
+  zbuf_free(&diagnostics);
+  return exit_code;
+}
+
+static int context_verify_command(const Command *command) {
+  const char *storage = context_storage_dir();
+  if (!dir_exists(storage)) {
+    return context_verify_emit_empty("CTX_CONTEXT_STORAGE_MISSING", "warning", "semantic context storage does not exist", storage, 0);
+  }
+  char *root_file = join_cli_path(storage, "root.json");
+  if (!path_exists(root_file)) {
+    int code = context_verify_emit_empty("CTX_ROOT_POINTER_MISSING", "error", "semantic context root pointer does not exist", root_file, 1);
+    free(root_file);
+    return code;
+  }
+  ZDiag read_diag = {0};
+  char *root_pointer_json = z_read_file(root_file, &read_diag);
+  char *current_root = root_pointer_json ? context_json_get_string_or_null(root_pointer_json, "currentRoot", NULL) : NULL;
+  if (!current_root) {
+    int code = context_verify_emit_empty("CTX_ROOT_POINTER_MALFORMED", "error", "semantic context root pointer is malformed", root_file, 1);
+    free(root_pointer_json);
+    free(root_file);
+    return code;
+  }
+  char *root_snapshot_json = context_read_root_snapshot(storage, current_root);
+  if (!root_snapshot_json) {
+    char *snapshot_path = context_root_snapshot_path(storage, current_root);
+    int code = context_verify_emit_empty("CTX-ROOT-MISSING", "error", "current root snapshot does not exist", snapshot_path, 1);
+    free(snapshot_path);
+    free(current_root);
+    free(root_pointer_json);
+    free(root_file);
+    return code;
+  }
+
+  ZBuf diagnostics;
+  ZBuf nodes;
+  zbuf_init(&diagnostics);
+  zbuf_init(&nodes);
+  size_t diagnostic_count = 0;
+  size_t node_count = 0;
+  const char *root_excluded[] = {"contextRoot", NULL};
+  char *actual_root_hash = context_hash_json_excluding(root_snapshot_json, root_excluded);
+  if (!actual_root_hash || strcmp(actual_root_hash, current_root) != 0) {
+    context_verify_append_diagnostic(&diagnostics, &diagnostic_count, "CTX-ROOT", "error", NULL, "context root hash does not match canonical payload", root_file, NULL, current_root, actual_root_hash);
+  }
+  size_t checked_count = 0;
+  char **checked_hashes = command && command->include_superseded
+    ? context_root_all_hashes(root_snapshot_json, &checked_count)
+    : context_root_active_hashes(root_snapshot_json, &checked_count);
+  size_t referenced_count = 0;
+  char **referenced_hashes = context_root_all_hashes(root_snapshot_json, &referenced_count);
+  const char *node_excluded[] = {"hash", "lifecycle", NULL};
+
+  for (size_t i = 0; i < checked_count; i++) {
+    char *node_file = context_node_file_path(storage, checked_hashes[i]);
+    char *node_json = context_read_node(storage, checked_hashes[i]);
+    if (!node_json) {
+      context_verify_append_diagnostic(&diagnostics, &diagnostic_count, "CTX001", "error", NULL, "context root references missing node", node_file, checked_hashes[i], NULL, NULL);
+      free(node_file);
+      continue;
+    }
+    char *node_hash = context_json_get_string_or_null(node_json, "hash", NULL);
+    char *node_id = context_json_get_string_or_null(node_json, "nodeId", NULL);
+    char *actual_node_hash = context_hash_json_excluding(node_json, node_excluded);
+    if (!node_hash || !actual_node_hash || strcmp(node_hash, actual_node_hash) != 0) {
+      context_verify_append_diagnostic(&diagnostics, &diagnostic_count, "CTX-HASH", "error", node_id, "context node hash does not match canonical payload", node_file, NULL, node_hash, actual_node_hash);
+    }
+    ZBuf lifecycle;
+    ZBuf source_anchor;
+    ZBuf preconditions;
+    zbuf_init(&lifecycle);
+    zbuf_init(&source_anchor);
+    zbuf_init(&preconditions);
+    bool has_lifecycle = context_json_emit_field(&lifecycle, node_json, "lifecycle");
+    bool has_anchor = context_json_emit_field(&source_anchor, node_json, "sourceAnchor");
+    char *anchor_path = has_anchor ? context_json_get_string_or_null(source_anchor.data, "path", NULL) : NULL;
+    char *anchor_status = has_anchor ? context_json_get_string_or_null(source_anchor.data, "status", NULL) : NULL;
+    bool source_hash_is_null = false;
+    char *stored_source_hash = has_anchor ? context_json_get_string_or_null(source_anchor.data, "sourceHash", &source_hash_is_null) : NULL;
+    char *current_source_hash = NULL;
+    char *extracted_text = NULL;
+    if (has_anchor && anchor_path) {
+      size_t source_len = 0;
+      ZDiag source_diag = {0};
+      char *source = z_read_file_bytes(anchor_path, &source_len, &source_diag);
+      if (!source) {
+        context_verify_append_diagnostic(&diagnostics, &diagnostic_count, "CTX_SOURCE_MISSING", "error", node_id, "source anchor path does not exist", anchor_path, NULL, NULL, NULL);
+      } else {
+        current_source_hash = context_prefixed_sha256((const unsigned char *)source, source_len);
+        if (!source_hash_is_null && stored_source_hash && strcmp(stored_source_hash, current_source_hash) != 0) {
+          context_verify_append_diagnostic(&diagnostics, &diagnostic_count, "CTX_SOURCE_HASH_MISMATCH", "error", node_id, "source anchor hash does not match current source", anchor_path, NULL, stored_source_hash, current_source_hash);
+        }
+        ContextSourceRange range;
+        if (context_read_source_range(source_anchor.data, &range)) {
+          char *range_actual = NULL;
+          extracted_text = context_extract_range_text(source, source_len, &range, &range_actual);
+          if (!extracted_text) {
+            context_verify_append_diagnostic(&diagnostics, &diagnostic_count, "CTX_ANCHOR_RANGE_INVALID", "error", node_id, "source anchor range is invalid", anchor_path, NULL, NULL, range_actual);
+          } else {
+            context_verify_preconditions(node_json, node_id, anchor_path, extracted_text, &preconditions, &diagnostics, &diagnostic_count);
+          }
+          free(range_actual);
+          free(range.column_unit);
+        } else {
+          context_verify_append_diagnostic(&diagnostics, &diagnostic_count, "CTX_ANCHOR_RANGE_INVALID", "error", node_id, "source anchor range is invalid", anchor_path, NULL, NULL, "invalid range coordinates");
+        }
+        if (anchor_status && strcmp(anchor_status, "active") == 0) {
+          size_t indexed_count = 0;
+          char **indexed = context_source_index_hashes(storage, anchor_path, &indexed_count);
+          if (!context_hash_list_contains(indexed, indexed_count, checked_hashes[i])) {
+            context_verify_append_diagnostic(&diagnostics, &diagnostic_count, "CTX-INDEX", "error", node_id, "context node is missing from source index", anchor_path, checked_hashes[i], NULL, NULL);
+          }
+          context_free_hashes(indexed, indexed_count);
+        }
+        free(source);
+      }
+    }
+    if (!preconditions.data) zbuf_append(&preconditions, "[]");
+    context_verify_append_node_result(&nodes, &node_count, node_hash ? node_hash : checked_hashes[i], node_id ? node_id : "", has_lifecycle ? lifecycle.data : NULL, anchor_path, has_anchor ? anchor_status : "none", current_source_hash, preconditions.data);
+    free(node_hash);
+    free(node_id);
+    free(actual_node_hash);
+    free(anchor_path);
+    free(anchor_status);
+    free(stored_source_hash);
+    free(current_source_hash);
+    free(extracted_text);
+    zbuf_free(&lifecycle);
+    zbuf_free(&source_anchor);
+    zbuf_free(&preconditions);
+    free(node_json);
+    free(node_file);
+  }
+
+  char *nodes_dir = join_cli_path(storage, "nodes");
+  DIR *dir = opendir(nodes_dir);
+  if (dir) {
+    struct dirent *entry = NULL;
+    while ((entry = readdir(dir)) != NULL) {
+      size_t len = strlen(entry->d_name);
+      if (len <= 5 || strcmp(entry->d_name + len - 5, ".json") != 0) continue;
+      ZBuf hash;
+      zbuf_init(&hash);
+      zbuf_append(&hash, "sha256:");
+      context_verify_append_len(&hash, entry->d_name, len - 5);
+      if (!context_hash_list_contains(referenced_hashes, referenced_count, hash.data)) {
+        char *path = join_cli_path(nodes_dir, entry->d_name);
+        context_verify_append_diagnostic(&diagnostics, &diagnostic_count, "CTX-ORPHAN", "error", NULL, "node file is not referenced by root", path, hash.data, NULL, NULL);
+        free(path);
+      }
+      zbuf_free(&hash);
+    }
+    closedir(dir);
+  }
+  free(nodes_dir);
+
+  printf("{\n  \"schemaVersion\": 1,\n  \"mode\": \"context-verify\",\n  \"ok\": %s,\n  \"checkedNodes\": %zu,\n  \"nodes\": [\n", diagnostic_count == 0 ? "true" : "false", checked_count);
+  fputs(nodes.data ? nodes.data : "", stdout);
+  printf("\n  ],\n  \"diagnostics\": ");
+  if (diagnostic_count > 0) {
+    printf("[\n");
+    fputs(diagnostics.data ? diagnostics.data : "", stdout);
+    printf("\n  ]");
+  } else {
+    printf("[]");
+  }
+  printf("\n}\n");
+
+  int exit_code = diagnostic_count > 0 ? 1 : 0;
+  free(actual_root_hash);
+  context_free_hashes(checked_hashes, checked_count);
+  context_free_hashes(referenced_hashes, referenced_count);
+  zbuf_free(&diagnostics);
+  zbuf_free(&nodes);
+  free(root_snapshot_json);
+  free(current_root);
+  free(root_pointer_json);
+  free(root_file);
+  return exit_code;
+}
+
 int main(int argc, char **argv) {
   if (argc >= 2 && (strcmp(argv[1], "--help") == 0 || strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "help") == 0)) {
     print_help();
@@ -9425,6 +9868,9 @@ int main(int argc, char **argv) {
     }
     if (command.kind && strcmp(command.kind, "project") == 0) {
       return context_project_command(&command);
+    }
+    if (command.kind && strcmp(command.kind, "verify") == 0) {
+      return context_verify_command(&command);
     }
     print_command_help("context");
     return 1;

@@ -38,6 +38,27 @@ function sha256File(path) {
   return createHash("sha256").update(readFileSync(path)).digest("hex");
 }
 
+function sha256Text(text) {
+  return `sha256:${createHash("sha256").update(text).digest("hex")}`;
+}
+
+function canonicalize(value) {
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map((item) => canonicalize(item)).join(",")}]`;
+  const keys = Object.keys(value).filter((key) => value[key] !== undefined).sort();
+  return `{${keys.map((key) => `${JSON.stringify(key)}:${canonicalize(value[key])}`).join(",")}}`;
+}
+
+function contextNodeHash(node) {
+  const { hash: _hash, lifecycle: _lifecycle, ...payload } = node;
+  return sha256Text(canonicalize(payload));
+}
+
+function contextRootHash(root) {
+  const { contextRoot: _contextRoot, ...payload } = root;
+  return sha256Text(canonicalize(payload));
+}
+
 function repeatBuildHash(args, firstPath, repeatOut, repeatPath = repeatOut) {
   const repeatArgs = [...args];
   const outIndex = repeatArgs.indexOf("--out");
@@ -238,6 +259,7 @@ for (const [command, expected] of [
   [["fix", "--help"], /Usage: zero fix/],
   [["context", "--help"], /Usage: zero context/],
   [["context", "project", "--help"], /Usage: zero context/],
+  [["context", "verify", "--help"], /Usage: zero context/],
 ] as Array<[string[], RegExp]>) {
   assert.match(zero(command).stdout, expected);
 }
@@ -482,6 +504,204 @@ for (const [command, expected] of [
     assert.equal(result.code, 0);
   } finally {
     rmSync(ctxDir, { recursive: true, force: true });
+  }
+}
+
+function writeVerifyRoot(ctxDir, activeNodes, sourceIndexSources = {}, extraNodes = []) {
+  const rootHashPlaceholder = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+  const sourceIndexFile = join(ctxDir, "indexes", "source-index.json");
+  const root = {
+    schemaVersion: 1,
+    contextRoot: rootHashPlaceholder,
+    parentRoot: null,
+    reason: "init",
+    activeNodes,
+    nodes: activeNodes,
+    supersededNodes: [],
+    archivedNodes: [],
+    createdAt: null,
+    indexes: {
+      sourceIndex: sourceIndexFile,
+    },
+  };
+  root.contextRoot = contextRootHash(root);
+  const rootSnapshotFile = join(ctxDir, "roots", `${root.contextRoot.replace("sha256:", "")}.json`);
+  mkdirSync(join(ctxDir, "roots"), { recursive: true });
+  mkdirSync(join(ctxDir, "indexes"), { recursive: true });
+  mkdirSync(join(ctxDir, "nodes"), { recursive: true });
+  writeFileSync(join(ctxDir, "root.json"), `${JSON.stringify({
+    schemaVersion: 1,
+    currentRoot: root.contextRoot,
+    previousRoot: null,
+    rootPath: rootSnapshotFile,
+    indexes: {
+      sourceIndex: sourceIndexFile,
+    },
+  }, null, 2)}\n`);
+  writeFileSync(rootSnapshotFile, `${JSON.stringify(root, null, 2)}\n`);
+  writeFileSync(sourceIndexFile, `${JSON.stringify({ schemaVersion: 1, sources: sourceIndexSources }, null, 2)}\n`);
+  for (const node of extraNodes) {
+    writeFileSync(join(ctxDir, "nodes", `${node.hash.replace("sha256:", "")}.json`), `${JSON.stringify(node, null, 2)}\n`);
+  }
+  return root;
+}
+
+function makeVerifyNode(sourceFile, sourceHash, precondition = "let") {
+  const node = {
+    schemaVersion: 1,
+    kind: "repair-memory",
+    nodeId: "ctx:repair-memory:typ009:make-binding-mutable",
+    sourceAnchor: {
+      path: sourceFile,
+      range: {
+        start: { line: 1, column: 1 },
+        end: { line: 1, column: 4 },
+        columnUnit: "utf8-byte",
+      },
+      sourceHash,
+      status: "active",
+    },
+    codes: ["DIAGNOSTIC_REPAIR", "MUTABLE_BINDING_REQUIRED"],
+    diagnosticCode: "TYP009",
+    repairId: "make-binding-mutable",
+    residualSummary: "Make the binding mutable before passing it to mutable memory APIs.",
+    projection: {
+      kind: "context-projection",
+      frontier: {
+        diagnostics: ["TYP009"],
+        repairs: ["make-binding-mutable"],
+        edits: [{ oldText: "let", newText: "let mut", precondition: { kind: "exact-text", text: precondition } }],
+      },
+    },
+    parents: [],
+    lifecycle: { state: "active", supersedes: [], supersededBy: null },
+    hash: "",
+  };
+  node.hash = contextNodeHash(node);
+  return node;
+}
+
+{
+  const tmpDir = mkdtempSync(join(tmpdir(), "zero-ctx-verify-missing-"));
+  try {
+    const result = json(["context", "verify", "--json"], { env: { ZERO_CONTEXT_DIR: join(tmpDir, "nonexistent") } });
+    assert.equal(result.body.schemaVersion, 1);
+    assert.equal(result.body.mode, "context-verify");
+    assert.equal(result.body.ok, false);
+    assert.equal(result.body.diagnostics[0].code, "CTX_CONTEXT_STORAGE_MISSING");
+    assert.equal(result.code, 0);
+  } finally {
+    rmSync(tmpDir, { recursive: true, force: true });
+  }
+}
+
+{
+  const ctxDir = join(outDir, "context-verify-empty-fixture");
+  rmSync(ctxDir, { recursive: true, force: true });
+  writeVerifyRoot(ctxDir, []);
+  try {
+    const result = json(["context", "verify", "--json"], { env: { ZERO_CONTEXT_DIR: ctxDir } });
+    assert.equal(result.body.schemaVersion, 1);
+    assert.equal(result.body.mode, "context-verify");
+    assert.equal(result.body.ok, true);
+    assert.equal(result.body.checkedNodes, 0);
+    assert.deepEqual(result.body.nodes, []);
+    assert.deepEqual(result.body.diagnostics, []);
+    assert.equal(result.code, 0);
+  } finally {
+    rmSync(ctxDir, { recursive: true, force: true });
+  }
+}
+
+{
+  const ctxDir = join(outDir, "context-verify-valid-fixture");
+  const sourceFile = join(outDir, "context-verify-valid.0");
+  rmSync(ctxDir, { recursive: true, force: true });
+  writeFileSync(sourceFile, "let value = 1\n");
+  const node = makeVerifyNode(sourceFile, `sha256:${sha256File(sourceFile)}`);
+  writeVerifyRoot(ctxDir, [node.hash], { [sourceFile]: [node.hash] }, [node]);
+  try {
+    const result = json(["context", "verify", "--json"], { env: { ZERO_CONTEXT_DIR: ctxDir } });
+    assert.equal(result.body.ok, true);
+    assert.equal(result.body.checkedNodes, 1);
+    assert.equal(result.body.nodes[0].preconditions[0].ok, true);
+    assert.equal(result.body.nodes[0].sourceAnchor.currentSourceHash, `sha256:${sha256File(sourceFile)}`);
+    assert.deepEqual(result.body.diagnostics, []);
+    assert.equal(result.code, 0);
+  } finally {
+    rmSync(ctxDir, { recursive: true, force: true });
+    rmSync(sourceFile, { force: true });
+  }
+}
+
+{
+  const ctxDir = join(outDir, "context-verify-hash-mismatch-fixture");
+  const sourceFile = join(outDir, "context-verify-hash-mismatch.0");
+  rmSync(ctxDir, { recursive: true, force: true });
+  writeFileSync(sourceFile, "let value = 1\n");
+  const node = makeVerifyNode(sourceFile, `sha256:${sha256File(sourceFile)}`);
+  const storedHash = "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+  node.hash = storedHash;
+  writeVerifyRoot(ctxDir, [storedHash], { [sourceFile]: [storedHash] }, [node]);
+  try {
+    const result = json(["context", "verify", "--json"], { allowFailure: true, env: { ZERO_CONTEXT_DIR: ctxDir } });
+    assert.equal(result.body.ok, false);
+    assert.equal(result.body.diagnostics.some((diagnostic) => diagnostic.code === "CTX-HASH"), true);
+    assert.equal(result.code, 1);
+  } finally {
+    rmSync(ctxDir, { recursive: true, force: true });
+    rmSync(sourceFile, { force: true });
+  }
+}
+
+{
+  const ctxDir = join(outDir, "context-verify-source-missing-fixture");
+  const sourceFile = join(outDir, "context-verify-source-missing.0");
+  rmSync(ctxDir, { recursive: true, force: true });
+  rmSync(sourceFile, { force: true });
+  const node = makeVerifyNode(sourceFile, null);
+  writeVerifyRoot(ctxDir, [node.hash], { [sourceFile]: [node.hash] }, [node]);
+  try {
+    const result = json(["context", "verify", "--json"], { allowFailure: true, env: { ZERO_CONTEXT_DIR: ctxDir } });
+    assert.equal(result.body.diagnostics.some((diagnostic) => diagnostic.code === "CTX_SOURCE_MISSING"), true);
+    assert.equal(result.code, 1);
+  } finally {
+    rmSync(ctxDir, { recursive: true, force: true });
+  }
+}
+
+{
+  const ctxDir = join(outDir, "context-verify-precondition-fixture");
+  const sourceFile = join(outDir, "context-verify-precondition.0");
+  rmSync(ctxDir, { recursive: true, force: true });
+  writeFileSync(sourceFile, "var value = 1\n");
+  const node = makeVerifyNode(sourceFile, `sha256:${sha256File(sourceFile)}`);
+  writeVerifyRoot(ctxDir, [node.hash], { [sourceFile]: [node.hash] }, [node]);
+  try {
+    const result = json(["context", "verify", "--json"], { allowFailure: true, env: { ZERO_CONTEXT_DIR: ctxDir } });
+    assert.equal(result.body.diagnostics.some((diagnostic) => diagnostic.code === "CTX_PRECONDITION_MISMATCH"), true);
+    assert.equal(result.body.nodes[0].preconditions[0].ok, false);
+    assert.equal(result.code, 1);
+  } finally {
+    rmSync(ctxDir, { recursive: true, force: true });
+    rmSync(sourceFile, { force: true });
+  }
+}
+
+{
+  const ctxDir = join(outDir, "context-verify-orphan-fixture");
+  const sourceFile = join(outDir, "context-verify-orphan.0");
+  rmSync(ctxDir, { recursive: true, force: true });
+  writeFileSync(sourceFile, "let value = 1\n");
+  const orphan = makeVerifyNode(sourceFile, `sha256:${sha256File(sourceFile)}`);
+  writeVerifyRoot(ctxDir, [], {}, [orphan]);
+  try {
+    const result = json(["context", "verify", "--json"], { allowFailure: true, env: { ZERO_CONTEXT_DIR: ctxDir } });
+    assert.equal(result.body.diagnostics.some((diagnostic) => diagnostic.code === "CTX-ORPHAN"), true);
+    assert.equal(result.code, 1);
+  } finally {
+    rmSync(ctxDir, { recursive: true, force: true });
+    rmSync(sourceFile, { force: true });
   }
 }
 
