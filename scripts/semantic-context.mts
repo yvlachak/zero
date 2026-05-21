@@ -172,6 +172,38 @@ type SkippedFixPlanNode = {
   message: string;
 };
 
+type ContextEvent = {
+  schemaVersion: 1;
+  kind: "context-event";
+  eventId: string;
+  eventHash: string;
+  mode: "context-check-cycle";
+  sourceFile: string;
+  previousRoot: string;
+  currentRoot: string;
+  rootChanged: boolean;
+  captured: Array<{
+    nodeId: string;
+    hash: string;
+    action: CapturedFixPlanNode["action"];
+  }>;
+  skipped: SkippedFixPlanNode[];
+  verification: {
+    ok: boolean;
+    checkedNodes: number;
+  };
+  diagnostics: Diagnostic[];
+};
+
+type ContextEventSummary = {
+  eventHash: string;
+  mode: ContextEvent["mode"];
+  sourceFile: string;
+  previousRoot: string;
+  currentRoot: string;
+  rootChanged: boolean;
+};
+
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(scriptDir, "..");
 function displayPath(filePath: string) {
@@ -183,6 +215,7 @@ function displayPath(filePath: string) {
 let contextDir = "";
 let nodesDir = "";
 let rootsDir = "";
+let eventsDir = "";
 let indexesDir = "";
 let rootPath = "";
 let sourceIndexPath = "";
@@ -193,6 +226,7 @@ function configureContextDir(dir = process.env.ZERO_CONTEXT_DIR) {
   contextDir = dir ? path.resolve(repoRoot, dir) : path.join(repoRoot, ".zero/context");
   nodesDir = path.join(contextDir, "nodes");
   rootsDir = path.join(contextDir, "roots");
+  eventsDir = path.join(contextDir, "events");
   indexesDir = path.join(contextDir, "indexes");
   rootPath = path.join(contextDir, "root.json");
   sourceIndexPath = path.join(indexesDir, "source-index.json");
@@ -210,6 +244,7 @@ function usage(): never {
   semantic-context project --source <file> --json [--include-superseded]
   semantic-context verify --json [--include-superseded]
   semantic-context check-cycle --source <file> --json
+  semantic-context events --json
   semantic-context diff --from <context-dir-or-root-snapshot> --to <context-dir-or-root-snapshot> --json`);
   process.exit(1);
 }
@@ -250,6 +285,7 @@ function parseArgs(argv: string[]) {
 function ensureLayout() {
   mkdirSync(nodesDir, { recursive: true });
   mkdirSync(rootsDir, { recursive: true });
+  mkdirSync(eventsDir, { recursive: true });
   mkdirSync(indexesDir, { recursive: true });
   if (!existsSync(sourceIndexPath)) writeJson(sourceIndexPath, { schemaVersion: 1, sources: {} } satisfies SourceIndex);
   if (!existsSync(rootPath)) writeRoot([], [], "init");
@@ -420,6 +456,14 @@ function nodePath(hash: string) {
   return path.join(nodesDir, `${hash.replace("sha256:", "")}.json`);
 }
 
+function eventPath(hash: string) {
+  return path.join(eventsDir, `${hash.replace("sha256:", "")}.json`);
+}
+
+function eventFilenames() {
+  return existsSync(eventsDir) ? readdirSync(eventsDir).filter((item) => item.endsWith(".json")).sort() : [];
+}
+
 function activeLifecycle(): SemanticNode["lifecycle"] {
   return {
     state: "active",
@@ -438,6 +482,41 @@ function writeNode(node: SemanticNode) {
 
 function readNode(hash: string) {
   return readJson<SemanticNode>(nodePath(hash));
+}
+
+function withoutEventHash(event: ContextEvent): JsonValue {
+  const { eventHash: _eventHash, ...payload } = event;
+  return payload as unknown as JsonValue;
+}
+
+export function contextEventHash(event: ContextEvent) {
+  return sha256Text(canonicalize(withoutEventHash(event)));
+}
+
+function nextEventId() {
+  return `ctx:event:${String(eventFilenames().length + 1).padStart(6, "0")}`;
+}
+
+function writeContextEvent(input: Omit<ContextEvent, "eventId" | "eventHash">) {
+  const eventId = nextEventId();
+  const event: ContextEvent = {
+    schemaVersion: input.schemaVersion,
+    kind: input.kind,
+    eventId,
+    eventHash: "",
+    mode: input.mode,
+    sourceFile: input.sourceFile,
+    previousRoot: input.previousRoot,
+    currentRoot: input.currentRoot,
+    rootChanged: input.rootChanged,
+    captured: input.captured,
+    skipped: input.skipped,
+    verification: input.verification,
+    diagnostics: input.diagnostics,
+  };
+  event.eventHash = contextEventHash(event);
+  writeJson(eventPath(event.eventHash), event as unknown as JsonValue);
+  return event;
 }
 
 function rebuildSourceIndex(activeHashes: string[]) {
@@ -1208,6 +1287,27 @@ function commandCheckCycle(sourceOption: string | boolean | undefined) {
     ...projection.diagnostics,
     ...verification.diagnostics,
   ];
+  const rootChanged = previousRoot !== currentRoot;
+  const event = writeContextEvent({
+    schemaVersion: 1,
+    kind: "context-event",
+    mode: "context-check-cycle",
+    sourceFile: source,
+    previousRoot,
+    currentRoot,
+    rootChanged,
+    captured: capture.captured.map((node) => ({
+      nodeId: node.nodeId,
+      hash: node.hash,
+      action: node.action,
+    })),
+    skipped: capture.skipped,
+    verification: {
+      ok: verification.ok,
+      checkedNodes: verification.checkedNodes,
+    },
+    diagnostics,
+  });
   console.log(JSON.stringify({
     schemaVersion: 1,
     mode: "context-check-cycle",
@@ -1215,7 +1315,7 @@ function commandCheckCycle(sourceOption: string | boolean | undefined) {
     rootTransition: {
       previousRoot,
       currentRoot,
-      changed: previousRoot !== currentRoot,
+      changed: rootChanged,
     },
     capture: {
       captured: capture.captured,
@@ -1229,9 +1329,62 @@ function commandCheckCycle(sourceOption: string | boolean | undefined) {
       checkedNodes: verification.checkedNodes,
       diagnostics: verification.diagnostics,
     },
+    event: {
+      eventHash: event.eventHash,
+      path: displayPath(eventPath(event.eventHash)),
+    },
     diagnostics,
   }, null, 2));
   if (hasError(diagnostics)) process.exitCode = 1;
+}
+
+function readContextEvents(diagnostics: Diagnostic[]) {
+  const events: ContextEvent[] = [];
+  for (const filename of eventFilenames()) {
+    const filePath = path.join(eventsDir, filename);
+    try {
+      const event = readJson<ContextEvent>(filePath);
+      const actualHash = contextEventHash(event);
+      if (event.eventHash !== actualHash) {
+        pushDiagnostic(diagnostics, {
+          code: "CTX_EVENT_HASH_MISMATCH",
+          message: "context event hash does not match canonical payload",
+          path: displayPath(filePath),
+          expected: event.eventHash,
+          actual: actualHash,
+        });
+      }
+      events.push(event);
+    } catch (error) {
+      pushDiagnostic(diagnostics, {
+        code: "CTX_EVENT_MALFORMED",
+        message: error instanceof Error ? error.message : "context event is not valid JSON",
+        path: displayPath(filePath),
+      });
+    }
+  }
+  return events.sort((left, right) => left.eventId.localeCompare(right.eventId));
+}
+
+function commandEvents() {
+  ensureLayout();
+  const diagnostics: Diagnostic[] = [];
+  const events = readContextEvents(diagnostics);
+  const summaries: ContextEventSummary[] = events.map((event) => ({
+    eventHash: event.eventHash,
+    mode: event.mode,
+    sourceFile: event.sourceFile,
+    previousRoot: event.previousRoot,
+    currentRoot: event.currentRoot,
+    rootChanged: event.rootChanged,
+  }));
+  console.log(JSON.stringify({
+    schemaVersion: 1,
+    mode: "context-events",
+    events: summaries,
+    diagnostics,
+  }, null, 2));
+  if (diagnostics.length > 0) process.exitCode = 1;
 }
 
 function resolveContextInput(input: string) {
@@ -1476,6 +1629,7 @@ export function main(argv = process.argv.slice(2)) {
   else if (command === "project") commandProject(options.source, options.includeSuperseded);
   else if (command === "verify") commandVerify(options.includeSuperseded);
   else if (command === "check-cycle") commandCheckCycle(options.source);
+  else if (command === "events") commandEvents();
   else if (command === "diff") commandDiff(options.from, options.to);
   else usage();
 }

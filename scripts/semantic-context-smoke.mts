@@ -1,5 +1,6 @@
 #!/usr/bin/env -S node --experimental-strip-types --disable-warning=ExperimentalWarning
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -11,7 +12,7 @@ const fixtureDir = path.join("/tmp", `zero-semantic-context-fixtures-${process.p
 const source = "conformance/native/fail/mem-copy-immutable-dst.0";
 
 process.env.ZERO_CONTEXT_DIR = storage;
-const { main, nodeHash, rootHashForSourceIndex } = await import("./semantic-context.mts");
+const { canonicalize, main, nodeHash, rootHashForSourceIndex } = await import("./semantic-context.mts");
 
 function run(args: string[], options: { allowFailure?: boolean; storage?: string } = {}): any {
   const originalLog = console.log;
@@ -54,6 +55,15 @@ function tempJson(name: string, value: any) {
 
 function snapshotPath(dir: string, hash: string) {
   return path.join(dir, "roots", `${hash.replace("sha256:", "")}.json`);
+}
+
+function eventPath(dir: string, hash: string) {
+  return path.join(dir, "events", `${hash.replace("sha256:", "")}.json`);
+}
+
+function eventHash(event: any) {
+  const { eventHash: _eventHash, ...payload } = event;
+  return `sha256:${createHash("sha256").update(canonicalize(payload)).digest("hex")}`;
 }
 
 function readRootPointer(dir = storage) {
@@ -247,7 +257,30 @@ try {
   assert.equal(checkCycle.verification.ok, true);
   assert.equal(checkCycle.verification.checkedNodes, 1);
   assert.deepEqual(checkCycle.verification.diagnostics, []);
+  assert.match(checkCycle.event.eventHash, /^sha256:[0-9a-f]{64}$/);
+  assert.equal(checkCycle.event.path, eventPath(storage, checkCycle.event.eventHash).split(path.sep).join("/"));
   assert.deepEqual(checkCycle.diagnostics, []);
+  const checkCycleEvent = JSON.parse(readFileSync(eventPath(storage, checkCycle.event.eventHash), "utf8"));
+  assert.equal(checkCycleEvent.schemaVersion, 1);
+  assert.equal(checkCycleEvent.kind, "context-event");
+  assert.match(checkCycleEvent.eventId, /^ctx:event:\d{6}$/);
+  assert.equal(checkCycleEvent.eventHash, checkCycle.event.eventHash);
+  assert.equal(checkCycleEvent.eventHash, eventHash(checkCycleEvent));
+  assert.equal(checkCycleEvent.mode, "context-check-cycle");
+  assert.equal(checkCycleEvent.sourceFile, source);
+  assert.equal(checkCycleEvent.previousRoot, checkCycle.rootTransition.previousRoot);
+  assert.equal(checkCycleEvent.currentRoot, checkCycle.rootTransition.currentRoot);
+  assert.equal(checkCycleEvent.rootChanged, true);
+  assert.deepEqual(checkCycleEvent.captured, [
+    {
+      nodeId: checkCycle.capture.captured[0].nodeId,
+      hash: checkCycle.capture.captured[0].hash,
+      action: "added",
+    },
+  ]);
+  assert.deepEqual(checkCycleEvent.skipped, []);
+  assert.deepEqual(checkCycleEvent.verification, { ok: true, checkedNodes: 1 });
+  assert.deepEqual(checkCycleEvent.diagnostics, []);
 
   const repeatedCycle = run(["check-cycle", "--source", source, "--json"]);
   assert.equal(repeatedCycle.rootTransition.previousRoot, checkCycle.rootTransition.currentRoot);
@@ -257,6 +290,39 @@ try {
   assert.equal(repeatedCycle.capture.captured[0].action, "unchanged");
   assert.equal(repeatedCycle.projection.nodes.length, 1);
   assert.equal(repeatedCycle.verification.ok, true);
+  assert.match(repeatedCycle.event.eventHash, /^sha256:[0-9a-f]{64}$/);
+  assert.notEqual(repeatedCycle.event.eventHash, checkCycle.event.eventHash);
+  const repeatedCycleEvent = JSON.parse(readFileSync(eventPath(storage, repeatedCycle.event.eventHash), "utf8"));
+  assert.equal(repeatedCycleEvent.eventHash, repeatedCycle.event.eventHash);
+  assert.equal(repeatedCycleEvent.eventHash, eventHash(repeatedCycleEvent));
+  assert.equal(repeatedCycleEvent.previousRoot, checkCycle.rootTransition.currentRoot);
+  assert.equal(repeatedCycleEvent.currentRoot, checkCycle.rootTransition.currentRoot);
+  assert.equal(repeatedCycleEvent.rootChanged, false);
+  assert.deepEqual(repeatedCycleEvent.captured, [
+    {
+      nodeId: repeatedCycle.capture.captured[0].nodeId,
+      hash: repeatedCycle.capture.captured[0].hash,
+      action: "unchanged",
+    },
+  ]);
+
+  const contextEvents = run(["events", "--json"]);
+  assert.equal(contextEvents.schemaVersion, 1);
+  assert.equal(contextEvents.mode, "context-events");
+  assert.equal(contextEvents.events.length, 2);
+  assert.deepEqual(contextEvents.diagnostics, []);
+  assert(contextEvents.events.some((event: any) =>
+    event.eventHash === checkCycle.event.eventHash &&
+    event.previousRoot === checkCycle.rootTransition.previousRoot &&
+    event.currentRoot === checkCycle.rootTransition.currentRoot &&
+    event.rootChanged === true
+  ));
+  assert(contextEvents.events.some((event: any) =>
+    event.eventHash === repeatedCycle.event.eventHash &&
+    event.previousRoot === repeatedCycle.rootTransition.previousRoot &&
+    event.currentRoot === repeatedCycle.rootTransition.currentRoot &&
+    event.rootChanged === false
+  ));
 
   resetStorage();
   const previewPlan = tempJson("preview-plan.json", {
