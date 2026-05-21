@@ -15,17 +15,24 @@ type SourceRange = {
 
 type SemanticNode = {
   schemaVersion: 1;
-  kind: "repair-memory";
+  kind: "repair-memory" | "diagnostic-memory" | "explain-residual" | "graph-context";
   nodeId: string;
-  sourceAnchor: {
+  sourceAnchor?: {
     path: string;
     range: SourceRange;
     sourceHash: string | null;
     status: "active";
   };
   codes: string[];
-  diagnosticCode: string;
-  repairId: string;
+  diagnosticCode?: string;
+  repairId?: string;
+  severity?: string;
+  message?: string;
+  expected?: string;
+  actual?: string;
+  help?: string;
+  explain?: JsonValue;
+  graph?: JsonValue;
   residualSummary: string;
   projection: {
     kind: "context-projection";
@@ -48,7 +55,7 @@ type SemanticNode = {
   hash: string;
 };
 
-type RootReason = "init" | "capture-repair" | "capture-fix-plan" | "reconcile" | "manual";
+type RootReason = "init" | "capture-repair" | "capture-fix-plan" | "capture-check" | "capture-explain" | "capture-graph" | "reconcile" | "manual";
 
 type RootSnapshot = {
   schemaVersion: 1;
@@ -96,7 +103,7 @@ type NodeVerification = {
   nodeId: string;
   lifecycle: SemanticNode["lifecycle"];
   sourceAnchor: {
-    path: string;
+    path: string | null;
     status: string;
     currentSourceHash: string | null;
   };
@@ -260,6 +267,9 @@ function usage(): never {
   semantic-context init
   semantic-context capture-repair --source <file>
   semantic-context capture-fix-plan --source <file> [--fix-plan-json <path>]
+  semantic-context capture-check --source <file> --json
+  semantic-context capture-explain --code <diagnosticCode> --json
+  semantic-context capture-graph --source <file-or-project> --json
   semantic-context project --source <file> --json [--include-superseded]
   semantic-context verify --json [--include-superseded]
   semantic-context check-cycle --source <file> --json
@@ -286,6 +296,10 @@ function parseArgs(argv: string[]) {
       const value = rest[++i];
       if (!value) usage();
       options.source = value;
+    } else if (arg === "--code") {
+      const value = rest[++i];
+      if (!value) usage();
+      options.code = value;
     } else if (arg === "--from") {
       const value = rest[++i];
       if (!value) usage();
@@ -355,7 +369,7 @@ function sha256File(relativePath: string) {
 export function canonicalize(value: JsonValue): string {
   if (value === null || typeof value !== "object") return JSON.stringify(value);
   if (Array.isArray(value)) return `[${value.map((item) => canonicalize(item)).join(",")}]`;
-  const keys = Object.keys(value).sort();
+  const keys = Object.keys(value).filter((key) => value[key] !== undefined).sort();
   return `{${keys.map((key) => `${JSON.stringify(key)}:${canonicalize(value[key])}`).join(",")}}`;
 }
 
@@ -572,6 +586,7 @@ function rebuildSourceIndex(activeHashes: string[]) {
     const filePath = nodePath(hash);
     if (!existsSync(filePath)) continue;
     const node = readJson<SemanticNode>(filePath);
+    if (!node.sourceAnchor) continue;
     const sourcePath = node.sourceAnchor.path;
     sources[sourcePath] = [...(sources[sourcePath] ?? []), hash];
   }
@@ -1129,6 +1144,250 @@ function commandCaptureFixPlan(sourceOption: string | boolean | undefined, fixPl
   if (hasError(diagnostics)) process.exitCode = 1;
 }
 
+function readZeroJson(args: string[], diagnostics: Diagnostic[], pathName?: string): unknown | null {
+  try {
+    const stdout = execFileSync("bin/zero", args, { cwd: repoRoot, encoding: "utf8" });
+    return JSON.parse(stdout);
+  } catch (error) {
+    if (isObject(error) && typeof error.stdout === "string" && error.stdout.length > 0) {
+      try {
+        return JSON.parse(error.stdout);
+      } catch {
+        pushDiagnostic(diagnostics, {
+          code: "CTX_CAPTURE_JSON_MALFORMED",
+          message: "zero command emitted malformed JSON",
+          path: pathName,
+        });
+        return null;
+      }
+    }
+    pushDiagnostic(diagnostics, {
+      code: "CTX_CAPTURE_COMMAND_FAILED",
+      message: error instanceof Error ? error.message : "zero command failed",
+      path: pathName,
+    });
+    return null;
+  }
+}
+
+function diagnosticRange(diagnostic: Record<string, unknown>): SourceRange | null {
+  if (typeof diagnostic.line !== "number" || typeof diagnostic.column !== "number") return null;
+  const length = typeof diagnostic.length === "number" ? diagnostic.length : 1;
+  return {
+    start: { line: diagnostic.line, column: diagnostic.column },
+    end: { line: diagnostic.line, column: diagnostic.column + length },
+    columnUnit: "utf8-byte",
+  };
+}
+
+function makeDiagnosticMemoryNode(diagnostic: Record<string, unknown>, sourcePath: string): SemanticNode | null {
+  if (typeof diagnostic.code !== "string" || typeof diagnostic.message !== "string") return null;
+  const pathValue = typeof diagnostic.path === "string" ? repoRelative(diagnostic.path) : sourcePath;
+  const range = diagnosticRange(diagnostic);
+  const repair = isObject(diagnostic.repair) && typeof diagnostic.repair.id === "string" ? diagnostic.repair.id : undefined;
+  const node: SemanticNode = {
+    schemaVersion: 1,
+    kind: "diagnostic-memory",
+    nodeId: `ctx:diagnostic-memory:${slug(diagnostic.code)}:${slug(pathValue)}:${diagnostic.line ?? "unknown"}:${diagnostic.column ?? "unknown"}`,
+    ...(range ? {
+      sourceAnchor: {
+        path: pathValue,
+        range,
+        sourceHash: existsSync(path.join(repoRoot, pathValue)) ? sha256File(pathValue) : null,
+        status: "active" as const,
+      },
+    } : {}),
+    codes: [
+      "DIAGNOSTIC_MEMORY",
+      ...(typeof diagnostic.severity === "string" ? [`DIAGNOSTIC_${diagnostic.severity.toUpperCase()}`] : []),
+      ...(derivedDiagnosticCode(diagnostic.code) ? [derivedDiagnosticCode(diagnostic.code) as string] : []),
+    ],
+    diagnosticCode: diagnostic.code,
+    repairId: repair,
+    severity: typeof diagnostic.severity === "string" ? diagnostic.severity : undefined,
+    message: diagnostic.message,
+    expected: typeof diagnostic.expected === "string" ? diagnostic.expected : undefined,
+    actual: typeof diagnostic.actual === "string" ? diagnostic.actual : undefined,
+    help: typeof diagnostic.help === "string" ? diagnostic.help : undefined,
+    residualSummary: typeof diagnostic.help === "string" ? diagnostic.help : diagnostic.message,
+    projection: {
+      kind: "context-projection",
+      frontier: {
+        diagnostics: [diagnostic.code],
+        repairs: repair ? [repair] : [],
+        edits: [],
+      },
+    },
+    parents: [],
+    lifecycle: activeLifecycle(),
+    hash: "",
+  };
+  node.hash = nodeHash(node);
+  return node;
+}
+
+function commandCaptureCheck(sourceOption: string | boolean | undefined) {
+  if (typeof sourceOption !== "string") usage();
+  ensureLayout();
+  const source = repoRelative(sourceOption);
+  const diagnostics: Diagnostic[] = [];
+  const captured = [];
+  const output = readZeroJson(["check", "--json", source], diagnostics, source);
+  if (isObject(output) && Array.isArray(output.diagnostics)) {
+    for (const diagnostic of output.diagnostics) {
+      if (!isObject(diagnostic)) continue;
+      const node = makeDiagnosticMemoryNode(diagnostic, source);
+      if (!node) continue;
+      const stored = storeNode(node, "capture-check");
+      captured.push({
+        nodeId: stored.node.nodeId,
+        hash: stored.node.hash,
+        action: stored.action,
+        kind: stored.node.kind,
+        diagnosticCode: stored.node.diagnosticCode,
+        sourceAnchor: stored.node.sourceAnchor ?? null,
+      });
+    }
+  }
+  const result = {
+    schemaVersion: 1,
+    mode: "context-capture-check",
+    ok: !hasError(diagnostics),
+    sourceFile: source,
+    captured,
+    diagnostics,
+  };
+  console.log(JSON.stringify(result, null, 2));
+  if (hasError(diagnostics)) process.exitCode = 1;
+}
+
+function makeExplainResidualNode(explain: Record<string, unknown>, code: string): SemanticNode {
+  const repair = isObject(explain.repair) && typeof explain.repair.id === "string" ? explain.repair.id : undefined;
+  const title = typeof explain.title === "string" ? explain.title : code;
+  const summary = typeof explain.summary === "string" ? explain.summary : title;
+  const node: SemanticNode = {
+    schemaVersion: 1,
+    kind: "explain-residual",
+    nodeId: `ctx:explain-residual:${slug(code)}`,
+    codes: [
+      "DIAGNOSTIC_EXPLAIN",
+      ...(derivedDiagnosticCode(code) ? [derivedDiagnosticCode(code) as string] : []),
+    ],
+    diagnosticCode: code,
+    repairId: repair,
+    residualSummary: summary,
+    explain: explain as JsonValue,
+    projection: {
+      kind: "context-projection",
+      frontier: {
+        diagnostics: [code],
+        repairs: repair ? [repair] : [],
+        edits: [],
+      },
+    },
+    parents: [],
+    lifecycle: activeLifecycle(),
+    hash: "",
+  };
+  node.hash = nodeHash(node);
+  return node;
+}
+
+function commandCaptureExplain(codeOption: string | boolean | undefined) {
+  if (typeof codeOption !== "string") usage();
+  ensureLayout();
+  const diagnostics: Diagnostic[] = [];
+  const captured = [];
+  const output = readZeroJson(["explain", "--json", codeOption], diagnostics, codeOption);
+  if (isObject(output)) {
+    const code = typeof output.code === "string" ? output.code : codeOption;
+    const stored = storeNode(makeExplainResidualNode(output, code), "capture-explain");
+    captured.push({
+      nodeId: stored.node.nodeId,
+      hash: stored.node.hash,
+      action: stored.action,
+      kind: stored.node.kind,
+      diagnosticCode: stored.node.diagnosticCode,
+    });
+  }
+  const result = {
+    schemaVersion: 1,
+    mode: "context-capture-explain",
+    ok: !hasError(diagnostics),
+    diagnosticCode: codeOption,
+    captured,
+    diagnostics,
+  };
+  console.log(JSON.stringify(result, null, 2));
+  if (hasError(diagnostics)) process.exitCode = 1;
+}
+
+function makeGraphContextNode(sourcePath: string, graph: unknown): SemanticNode {
+  const diagnostics = isObject(graph) && Array.isArray(graph.diagnostics)
+    ? graph.diagnostics.filter((diagnostic): diagnostic is Record<string, unknown> => isObject(diagnostic))
+    : [];
+  const node: SemanticNode = {
+    schemaVersion: 1,
+    kind: "graph-context",
+    nodeId: `ctx:graph-context:${slug(sourcePath)}`,
+    sourceAnchor: {
+      path: sourcePath,
+      range: {
+        start: { line: 1, column: 1 },
+        end: { line: 1, column: 1 },
+        columnUnit: "utf8-byte",
+      },
+      sourceHash: existsSync(path.join(repoRoot, sourcePath)) ? sha256File(sourcePath) : null,
+      status: "active",
+    },
+    codes: ["GRAPH_CONTEXT"],
+    residualSummary: `Graph context for ${sourcePath}.`,
+    graph: graph as JsonValue,
+    projection: {
+      kind: "context-projection",
+      frontier: {
+        diagnostics: diagnostics.map((diagnostic) => typeof diagnostic.code === "string" ? diagnostic.code : "").filter((code) => code.length > 0),
+        repairs: [],
+        edits: [],
+      },
+    },
+    parents: [],
+    lifecycle: activeLifecycle(),
+    hash: "",
+  };
+  node.hash = nodeHash(node);
+  return node;
+}
+
+function commandCaptureGraph(sourceOption: string | boolean | undefined) {
+  if (typeof sourceOption !== "string") usage();
+  ensureLayout();
+  const source = repoRelative(sourceOption);
+  const diagnostics: Diagnostic[] = [];
+  const captured = [];
+  const output = readZeroJson(["graph", "--json", source], diagnostics, source);
+  if (output !== null) {
+    const stored = storeNode(makeGraphContextNode(source, output), "capture-graph");
+    captured.push({
+      nodeId: stored.node.nodeId,
+      hash: stored.node.hash,
+      action: stored.action,
+      kind: stored.node.kind,
+      sourceAnchor: stored.node.sourceAnchor ?? null,
+    });
+  }
+  const result = {
+    schemaVersion: 1,
+    mode: "context-capture-graph",
+    ok: !hasError(diagnostics),
+    sourceFile: source,
+    captured,
+    diagnostics,
+  };
+  console.log(JSON.stringify(result, null, 2));
+  if (hasError(diagnostics)) process.exitCode = 1;
+}
+
 function projectNode(node: SemanticNode) {
   return {
     kind: node.kind,
@@ -1139,6 +1398,14 @@ function projectNode(node: SemanticNode) {
     codes: node.codes,
     diagnosticCode: node.diagnosticCode,
     repairId: node.repairId,
+    severity: node.severity,
+    message: node.message,
+    expected: node.expected,
+    actual: node.actual,
+    help: node.help,
+    sourceAnchor: node.sourceAnchor,
+    explain: node.explain,
+    graph: node.graph,
     residualSummary: node.residualSummary,
     frontier: node.projection.frontier,
   };
@@ -1154,7 +1421,7 @@ function projectSource(source: string, includeSuperseded: boolean) {
       const filePath = nodePath(hash);
       if (!existsSync(filePath)) continue;
       const node = readJson<SemanticNode>(filePath);
-      if (node.sourceAnchor.path === source) hashes.push(hash);
+      if (node.sourceAnchor?.path === source) hashes.push(hash);
     }
   }
   const nodes = [];
@@ -1192,8 +1459,8 @@ function verifyNode(node: SemanticNode, filePath: string, diagnostics: Diagnosti
     nodeId: node.nodeId,
     lifecycle: lifecycleOf(node),
     sourceAnchor: {
-      path: node.sourceAnchor.path,
-      status: node.sourceAnchor.status,
+      path: node.sourceAnchor?.path ?? null,
+      status: node.sourceAnchor?.status ?? "none",
       currentSourceHash: null,
     },
     preconditions: [],
@@ -1209,6 +1476,7 @@ function verifyNode(node: SemanticNode, filePath: string, diagnostics: Diagnosti
       actual: actualHash,
     });
   }
+  if (!node.sourceAnchor) return result;
   const sourcePath = path.join(repoRoot, node.sourceAnchor.path);
   if (!existsSync(sourcePath)) {
     pushDiagnostic(diagnostics, {
@@ -1295,7 +1563,7 @@ function verifyContext(includeSuperseded: boolean) {
     }
     const node = readJson<SemanticNode>(filePath);
     nodeResults.push(verifyNode(node, filePath, diagnostics));
-    if (lifecycleOf(node).state === "active" && !indexedHashes.has(hash)) {
+    if (lifecycleOf(node).state === "active" && node.sourceAnchor && !indexedHashes.has(hash)) {
       pushDiagnostic(diagnostics, { code: "CTX-INDEX", nodeId: node.nodeId, message: "context node is missing from source index", path: node.sourceAnchor.path, hash });
     }
   }
@@ -1752,6 +2020,7 @@ function readComplianceEvents(source: string | null, diagnostics: Diagnostic[]) 
 }
 
 function verifyAnchorOnly(node: SemanticNode, diagnostics: Diagnostic[]) {
+  if (!node.sourceAnchor) return true;
   const sourcePath = path.join(repoRoot, node.sourceAnchor.path);
   if (!existsSync(sourcePath)) {
     pushDiagnostic(diagnostics, {
@@ -1859,7 +2128,7 @@ function buildComplianceResult(sourceOption: string | boolean | undefined) {
       }
       const node = readNode(hash);
       active += 1;
-      activeNodesBySource[node.sourceAnchor.path] = [...(activeNodesBySource[node.sourceAnchor.path] ?? []), hash];
+      if (node.sourceAnchor) activeNodesBySource[node.sourceAnchor.path] = [...(activeNodesBySource[node.sourceAnchor.path] ?? []), hash];
       const actualHash = nodeHash(node);
       if (node.hash !== actualHash || node.hash !== hash) {
         nodeHashesOk = false;
@@ -1883,7 +2152,7 @@ function buildComplianceResult(sourceOption: string | boolean | undefined) {
           path: displayPath(filePath),
         });
       }
-      if (source === null || node.sourceAnchor.path === source) {
+      if (node.sourceAnchor && (source === null || node.sourceAnchor.path === source)) {
         anchorsChecked += 1;
         if (!verifyAnchorOnly(node, diagnostics)) anchorsOk = false;
       }
@@ -2106,7 +2375,7 @@ function sourceReconcileCandidates(source: string) {
   for (const hash of activeNodesOf(root)) {
     if (!existsSync(nodePath(hash))) continue;
     const node = readNode(hash);
-    if (node.sourceAnchor.path !== source) continue;
+    if (node.sourceAnchor?.path !== source) continue;
     const nodeDiagnostics: Diagnostic[] = [];
     verifyNode(node, nodePath(hash), nodeDiagnostics);
     for (const diagnostic of nodeDiagnostics) {
@@ -2245,7 +2514,8 @@ function reconcileArchive(hashOption: string | boolean | undefined) {
   writeNode(archivedNode);
   writeRoot(activeNodes, supersededNodes, "reconcile", archivedNodes);
   rebuildSourceIndex(activeNodes);
-  const event = reconcileEvent(loaded.node.sourceAnchor.path, previousRoot, diagnostics, [{ nodeId: loaded.node.nodeId, hash: loaded.hash, action: "archived" }]);
+  const sourceFile = loaded.node.sourceAnchor?.path ?? "";
+  const event = reconcileEvent(sourceFile, previousRoot, diagnostics, [{ nodeId: loaded.node.nodeId, hash: loaded.hash, action: "archived" }]);
   return {
     schemaVersion: 1,
     mode: "context-reconcile",
@@ -2255,7 +2525,7 @@ function reconcileArchive(hashOption: string | boolean | undefined) {
       nodeId: loaded.node.nodeId,
       hash: loaded.hash,
       lifecycle: archivedNode.lifecycle,
-      sourceFile: loaded.node.sourceAnchor.path,
+      sourceFile,
     },
     rootTransition: {
       previousRoot,
@@ -2283,12 +2553,12 @@ function reconcileRefreshAnchor(hashOption: string | boolean | undefined) {
   const loaded = requireActiveNode(hashOption, diagnostics);
   if (!loaded) return { schemaVersion: 1, mode: "context-reconcile", ok: false, action: "refresh-anchor", diagnostics };
   const preconditionText = firstExactTextPrecondition(loaded.node);
-  if (preconditionText === null || !existsSync(path.join(repoRoot, loaded.node.sourceAnchor.path))) {
+  if (!loaded.node.sourceAnchor || preconditionText === null || !existsSync(path.join(repoRoot, loaded.node.sourceAnchor.path))) {
     pushDiagnostic(diagnostics, {
       code: "CTX_RECONCILE_ANCHOR_NOT_FOUND",
       message: "refresh-anchor requires an exact-text precondition and readable source",
       hash: loaded.hash,
-      path: loaded.node.sourceAnchor.path,
+      path: loaded.node.sourceAnchor?.path,
     });
     return { schemaVersion: 1, mode: "context-reconcile", ok: false, action: "refresh-anchor", diagnostics };
   }
@@ -2362,6 +2632,14 @@ function reconcileSupersede(hashOption: string | boolean | undefined, summaryOpt
   if (typeof summaryOption !== "string") usage();
   const loaded = requireActiveNode(hashOption, diagnostics);
   if (!loaded) return { schemaVersion: 1, mode: "context-reconcile", ok: false, action: "supersede", diagnostics };
+  if (!loaded.node.sourceAnchor) {
+    pushDiagnostic(diagnostics, {
+      code: "CTX_RECONCILE_NODE_NOT_FOUND",
+      message: "supersede requires a source-anchored node",
+      hash: loaded.hash,
+    });
+    return { schemaVersion: 1, mode: "context-reconcile", ok: false, action: "supersede", diagnostics };
+  }
   const previousRoot = currentRootHash();
   const nextNode: SemanticNode = {
     ...loaded.node,
@@ -2677,6 +2955,9 @@ export function main(argv = process.argv.slice(2)) {
   if (command === "init") commandInit();
   else if (command === "capture-repair") commandCaptureRepair(options.source);
   else if (command === "capture-fix-plan") commandCaptureFixPlan(options.source, options.fixPlanJson);
+  else if (command === "capture-check") commandCaptureCheck(options.source);
+  else if (command === "capture-explain") commandCaptureExplain(options.code);
+  else if (command === "capture-graph") commandCaptureGraph(options.source);
   else if (command === "project") commandProject(options.source, options.includeSuperseded);
   else if (command === "verify") commandVerify(options.includeSuperseded);
   else if (command === "check-cycle") commandCheckCycle(options.source, options.policy);

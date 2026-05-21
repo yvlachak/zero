@@ -800,6 +800,63 @@ try {
   assert.deepEqual(fixtureProject.nodes[0].frontier, equivalentFixPlanProject.nodes[0].frontier);
 
   resetStorage();
+  run(["init"]);
+  const generalizedCheckCapture = run(["capture-check", "--source", source, "--json"]);
+  assert.equal(generalizedCheckCapture.ok, true);
+  assert.equal(generalizedCheckCapture.mode, "context-capture-check");
+  assert.equal(generalizedCheckCapture.captured.length, 1);
+  assert.equal(generalizedCheckCapture.captured[0].kind, "diagnostic-memory");
+  assert.equal(generalizedCheckCapture.captured[0].diagnosticCode, "TYP009");
+
+  const generalizedRepairCapture = run(["capture-fix-plan", "--source", source]);
+  assert.equal(generalizedRepairCapture.ok, true);
+  assert.equal(generalizedRepairCapture.captured[0].nodeId, "ctx:repair-memory:typ009:make-binding-mutable");
+
+  const generalizedExplainCapture = run(["capture-explain", "--code", "TYP009", "--json"]);
+  assert.equal(generalizedExplainCapture.ok, true);
+  assert.equal(generalizedExplainCapture.mode, "context-capture-explain");
+  assert.equal(generalizedExplainCapture.captured.length, 1);
+  assert.equal(generalizedExplainCapture.captured[0].kind, "explain-residual");
+  assert.equal(generalizedExplainCapture.captured[0].diagnosticCode, "TYP009");
+
+  const generalizedGraphCapture = run(["capture-graph", "--source", source, "--json"]);
+  assert.equal(generalizedGraphCapture.ok, true);
+  assert.equal(generalizedGraphCapture.mode, "context-capture-graph");
+  assert.equal(generalizedGraphCapture.captured.length, 1);
+  assert.equal(generalizedGraphCapture.captured[0].kind, "graph-context");
+
+  const generalizedProject = run(["project", "--source", source, "--json"]);
+  const projectedKinds = generalizedProject.nodes.map((node: any) => node.kind).sort();
+  assert(projectedKinds.includes("diagnostic-memory"));
+  assert(projectedKinds.includes("graph-context"));
+  assert(projectedKinds.includes("repair-memory"));
+  const generalizedCompliance = run(["compliance", "--json"]);
+  assert.equal(generalizedCompliance.ok, true);
+  assert.equal(generalizedCompliance.nodes.active, 4);
+
+  const generalizedEmptyDir = path.join("/tmp", `zero-semantic-context-generalized-empty-${process.pid}`);
+  const generalizedFullDir = path.join("/tmp", `zero-semantic-context-generalized-full-${process.pid}`);
+  try {
+    resetStorage(generalizedEmptyDir);
+    run(["init"], { storage: generalizedEmptyDir });
+    resetStorage(generalizedFullDir);
+    run(["init"], { storage: generalizedFullDir });
+    run(["capture-check", "--source", source, "--json"], { storage: generalizedFullDir });
+    run(["capture-fix-plan", "--source", source], { storage: generalizedFullDir });
+    run(["capture-explain", "--code", "TYP009", "--json"], { storage: generalizedFullDir });
+    run(["capture-graph", "--source", source, "--json"], { storage: generalizedFullDir });
+    const generalizedDiff = run(["diff", "--from", generalizedEmptyDir, "--to", generalizedFullDir, "--json"]);
+    assert.equal(generalizedDiff.ok, true);
+    assert(generalizedDiff.summary.added >= 4);
+    assert(generalizedDiff.nodes.added.some((node: any) => node.kind === "diagnostic-memory"));
+    assert(generalizedDiff.nodes.added.some((node: any) => node.kind === "explain-residual"));
+    assert(generalizedDiff.nodes.added.some((node: any) => node.kind === "graph-context"));
+  } finally {
+    resetStorage(generalizedEmptyDir);
+    resetStorage(generalizedFullDir);
+  }
+
+  resetStorage();
   const mismatchSource = tempFixture("precondition-mismatch.0");
   const mismatchCapture = run(["capture-repair", "--source", mismatchSource]);
   let mismatchText = readFileSync(mismatchSource, "utf8");
