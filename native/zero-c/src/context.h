@@ -11,6 +11,7 @@ char *context_root_pointer_path(const char *storage);
 char *context_root_snapshot_path(const char *storage, const char *current_root);
 char *context_node_path(const char *storage, const char *hash);
 char *context_event_path(const char *storage, const char *event_hash);
+char *context_source_index_path(const char *storage);
 char **context_event_filenames(const char *storage, size_t *out_count);
 char *context_event_hash(const char *event_json);
 char *context_node_lifecycle_state(const char *node_json);

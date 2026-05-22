@@ -82,6 +82,7 @@ static void print_command_help(const char *command);
 static int context_status_command(const Command *command);
 static int context_project_command(const Command *command);
 static int context_verify_command(const Command *command);
+static int context_compliance_command(const Command *command);
 
 static const char *diag_code(int code) {
   switch (code) {
@@ -3457,6 +3458,7 @@ static void print_command_help(const char *command) {
     printf("  status    Report semantic context storage status\n");
     printf("  project   Project active semantic context for a source\n");
     printf("  verify    Verify semantic context hashes and source anchors\n");
+    printf("  compliance Verify semantic context compliance state\n");
     printf("  help      Show this help\n");
   } else if (strcmp(command, "version") == 0 || strcmp(command, "--version") == 0) {
     printf("Usage: zero --version [--json]\n\n");
@@ -9803,6 +9805,98 @@ static int context_verify_command(const Command *command) {
   return exit_code;
 }
 
+static void context_compliance_append_stub_sections(ZBuf *out, bool source_index_ok) {
+  zbuf_append(out,
+    ",\n  \"timeline\": {\n"
+    "    \"events\": 0,\n"
+    "    \"eventHashesOk\": true,\n"
+    "    \"rootReferencesOk\": true,\n"
+    "    \"missingRoots\": 0,\n"
+    "    \"hashFailures\": 0\n"
+    "  },\n"
+    "  \"nodes\": {\n"
+    "    \"active\": 0,\n"
+    "    \"superseded\": 0,\n"
+    "    \"nodeHashesOk\": true,\n"
+    "    \"lifecycleOk\": true\n"
+    "  },\n"
+    "  \"anchors\": {\n"
+    "    \"checked\": 0,\n"
+    "    \"ok\": true\n"
+    "  },\n"
+    "  \"indexes\": {\n"
+    "    \"sourceIndexOk\": ");
+  zbuf_append(out, source_index_ok ? "true" : "false");
+  zbuf_append(out, "\n  }");
+}
+
+static int context_compliance_command(const Command *command) {
+  if (!command || !command->json) {
+    fprintf(stderr, "zero context compliance requires --json\n");
+    return 1;
+  }
+
+  const char *storage = context_storage_dir();
+  const char *source_option = command->source;
+  ZBuf diagnostics;
+  zbuf_init(&diagnostics);
+  size_t diagnostic_count = 0;
+
+  ContextComplianceRootState root_state;
+  context_compliance_read_root(storage, &root_state, &diagnostics, &diagnostic_count);
+
+  bool source_index_ok = true;
+  char *source_index_path = context_source_index_path(storage);
+  if (root_state.current_root_snapshot_json && (!source_index_path || !path_exists(source_index_path))) {
+    source_index_ok = false;
+    context_diagnostic_append(
+      &diagnostics,
+      &diagnostic_count,
+      NULL,
+      "CTX_COMPLIANCE_SOURCE_INDEX_MISSING",
+      "source index does not exist",
+      NULL,
+      NULL,
+      source_index_path,
+      NULL,
+      NULL);
+  }
+
+  bool ok = diagnostic_count == 0;
+  ZBuf out;
+  zbuf_init(&out);
+  zbuf_append(&out, "{\n  \"schemaVersion\": 1,\n  \"mode\": \"context-compliance\",\n  \"ok\": ");
+  zbuf_append(&out, ok ? "true" : "false");
+  zbuf_append(&out, ",\n  \"scope\": {\n    \"sourceFile\": ");
+  append_json_string_or_null(&out, source_option);
+  zbuf_append(&out, "\n  },\n  \"root\": {\n    \"currentRoot\": ");
+  append_json_string_or_null(&out, root_state.current_root);
+  zbuf_append(&out, ",\n    \"currentRootExists\": ");
+  zbuf_append(&out, root_state.current_root_snapshot_json ? "true" : "false");
+  zbuf_append(&out, ",\n    \"rootHashOk\": ");
+  zbuf_append(&out, root_state.root_hash_ok ? "true" : "false");
+  zbuf_append(&out, ",\n    \"parentChainOk\": ");
+  zbuf_append(&out, root_state.parent_chain_ok ? "true" : "false");
+  zbuf_appendf(&out, ",\n    \"rootDepth\": %zu\n  }", root_state.root_depth);
+  context_compliance_append_stub_sections(&out, source_index_ok);
+  zbuf_append(&out, ",\n  \"diagnostics\": ");
+  if (diagnostic_count > 0) {
+    zbuf_append(&out, "[");
+    zbuf_append(&out, diagnostics.data ? diagnostics.data : "");
+    zbuf_append(&out, "]");
+  } else {
+    zbuf_append(&out, "[]");
+  }
+  zbuf_append(&out, "\n}\n");
+  fputs(out.data, stdout);
+
+  zbuf_free(&out);
+  zbuf_free(&diagnostics);
+  context_compliance_root_state_free(&root_state);
+  free(source_index_path);
+  return ok ? 0 : 1;
+}
+
 int main(int argc, char **argv) {
   if (argc >= 2 && (strcmp(argv[1], "--help") == 0 || strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "help") == 0)) {
     print_help();
@@ -9874,6 +9968,9 @@ int main(int argc, char **argv) {
     }
     if (command.kind && strcmp(command.kind, "verify") == 0) {
       return context_verify_command(&command);
+    }
+    if (command.kind && strcmp(command.kind, "compliance") == 0) {
+      return context_compliance_command(&command);
     }
     print_command_help("context");
     return 1;

@@ -59,6 +59,31 @@ function contextRootHash(root) {
   return sha256Text(canonicalize(payload));
 }
 
+function uniqueSorted(items = []) {
+  return [...new Set(items)].sort();
+}
+
+function contextComplianceRootPayload(root) {
+  const activeNodes = uniqueSorted(root.activeNodes ?? root.nodes ?? []);
+  return {
+    schemaVersion: 1,
+    parentRoot: root.parentRoot ?? null,
+    reason: root.reason ?? "manual",
+    activeNodes,
+    nodes: activeNodes,
+    supersededNodes: uniqueSorted(root.supersededNodes ?? []),
+    archivedNodes: uniqueSorted(root.archivedNodes ?? []),
+    createdAt: null,
+    indexes: {
+      sourceIndex: root.indexes?.sourceIndex ?? ".zero/context/indexes/source-index.json",
+    },
+  };
+}
+
+function contextComplianceRootHash(root) {
+  return sha256Text(canonicalize(contextComplianceRootPayload(root)));
+}
+
 function repeatBuildHash(args, firstPath, repeatOut, repeatPath = repeatOut) {
   const repeatArgs = [...args];
   const outIndex = repeatArgs.indexOf("--out");
@@ -260,6 +285,7 @@ for (const [command, expected] of [
   [["context", "--help"], /Usage: zero context/],
   [["context", "project", "--help"], /Usage: zero context/],
   [["context", "verify", "--help"], /Usage: zero context/],
+  [["context", "compliance", "--help"], /Usage: zero context/],
 ] as Array<[string[], RegExp]>) {
   assert.match(zero(command).stdout, expected);
 }
@@ -546,6 +572,69 @@ function writeVerifyRoot(ctxDir, activeNodes, sourceIndexSources = {}, extraNode
   return root;
 }
 
+function makeComplianceRoot(ctxDir, parentRoot = null, overrides = {}) {
+  const sourceIndexFile = join(ctxDir, "indexes", "source-index.json");
+  const root = {
+    schemaVersion: 1,
+    contextRoot: "sha256:placeholder",
+    parentRoot,
+    reason: "manual",
+    activeNodes: [],
+    nodes: [],
+    supersededNodes: [],
+    archivedNodes: [],
+    createdAt: null,
+    indexes: {
+      sourceIndex: sourceIndexFile,
+    },
+    ...overrides,
+  };
+  root.contextRoot = contextComplianceRootHash(root);
+  return root;
+}
+
+function writeCompliancePointer(ctxDir, currentRoot, sourceIndexFile = join(ctxDir, "indexes", "source-index.json")) {
+  const rootSnapshotFile = join(ctxDir, "roots", `${currentRoot.replace("sha256:", "")}.json`);
+  writeFileSync(join(ctxDir, "root.json"), `${JSON.stringify({
+    schemaVersion: 1,
+    currentRoot,
+    previousRoot: null,
+    rootPath: rootSnapshotFile,
+    indexes: {
+      sourceIndex: sourceIndexFile,
+    },
+  }, null, 2)}\n`);
+  return rootSnapshotFile;
+}
+
+function writeComplianceRootSnapshot(ctxDir, root, filenameHash = root.contextRoot) {
+  mkdirSync(join(ctxDir, "roots"), { recursive: true });
+  const path = join(ctxDir, "roots", `${filenameHash.replace("sha256:", "")}.json`);
+  writeFileSync(path, `${JSON.stringify(root, null, 2)}\n`);
+  return path;
+}
+
+function writeComplianceSourceIndex(ctxDir, sources = {}) {
+  mkdirSync(join(ctxDir, "indexes"), { recursive: true });
+  const sourceIndexFile = join(ctxDir, "indexes", "source-index.json");
+  writeFileSync(sourceIndexFile, `${JSON.stringify({ schemaVersion: 1, sources }, null, 2)}\n`);
+  return sourceIndexFile;
+}
+
+function assertComplianceStubDefaults(body) {
+  assert.equal(body.timeline.events, 0);
+  assert.equal(body.timeline.eventHashesOk, true);
+  assert.equal(body.timeline.rootReferencesOk, true);
+  assert.equal(body.timeline.missingRoots, 0);
+  assert.equal(body.timeline.hashFailures, 0);
+  assert.equal(body.nodes.active, 0);
+  assert.equal(body.nodes.superseded, 0);
+  assert.equal(body.nodes.nodeHashesOk, true);
+  assert.equal(body.nodes.lifecycleOk, true);
+  assert.equal(body.anchors.checked, 0);
+  assert.equal(body.anchors.ok, true);
+}
+
 function makeVerifyNode(sourceFile, sourceHash, precondition = "let") {
   const node = {
     schemaVersion: 1,
@@ -761,6 +850,153 @@ function makeVerifyNode(sourceFile, sourceHash, precondition = "let") {
   } finally {
     rmSync(ctxDir, { recursive: true, force: true });
     rmSync(sourceFile, { force: true });
+  }
+}
+
+{
+  const ctxDir = join(outDir, "context-compliance-clean-fixture");
+  rmSync(ctxDir, { recursive: true, force: true });
+  mkdirSync(ctxDir, { recursive: true });
+  const root = makeComplianceRoot(ctxDir);
+  writeCompliancePointer(ctxDir, root.contextRoot);
+  writeComplianceRootSnapshot(ctxDir, root);
+  writeComplianceSourceIndex(ctxDir);
+  try {
+    const result = json(["context", "compliance", "--json"], { env: { ZERO_CONTEXT_DIR: ctxDir } });
+    assert.equal(result.body.schemaVersion, 1);
+    assert.equal(result.body.mode, "context-compliance");
+    assert.equal(result.body.ok, true);
+    assert.equal(result.body.scope.sourceFile, null);
+    assert.equal(result.body.root.currentRoot, root.contextRoot);
+    assert.equal(result.body.root.currentRootExists, true);
+    assert.equal(result.body.root.rootHashOk, true);
+    assert.equal(result.body.root.parentChainOk, true);
+    assert.equal(result.body.root.rootDepth, 1);
+    assert.equal(result.body.indexes.sourceIndexOk, true);
+    assertComplianceStubDefaults(result.body);
+    assert.deepEqual(result.body.diagnostics, []);
+    assert.equal(result.code, 0);
+
+    const scoped = json(["context", "compliance", "--source", "foo.0", "--json"], { env: { ZERO_CONTEXT_DIR: ctxDir } });
+    assert.equal(scoped.body.scope.sourceFile, "foo.0");
+    assert.equal(scoped.body.ok, true);
+    assert.equal(scoped.code, 0);
+  } finally {
+    rmSync(ctxDir, { recursive: true, force: true });
+  }
+}
+
+{
+  const ctxDir = join(outDir, "context-compliance-root-missing-fixture");
+  rmSync(ctxDir, { recursive: true, force: true });
+  mkdirSync(ctxDir, { recursive: true });
+  try {
+    const result = json(["context", "compliance", "--json"], { allowFailure: true, env: { ZERO_CONTEXT_DIR: ctxDir } });
+    assert.equal(result.body.schemaVersion, 1);
+    assert.equal(result.body.mode, "context-compliance");
+    assert.equal(result.body.ok, false);
+    assert.equal(result.body.root.currentRoot, null);
+    assert.equal(result.body.root.currentRootExists, false);
+    assert.equal(result.body.root.rootHashOk, false);
+    assert.equal(result.body.root.parentChainOk, false);
+    assert.equal(result.body.root.rootDepth, 0);
+    assert.equal(result.body.diagnostics.length, 1);
+    assert.equal(result.body.diagnostics[0].code, "CTX_COMPLIANCE_ROOT_MISSING");
+    assert.equal(result.code, 1);
+  } finally {
+    rmSync(ctxDir, { recursive: true, force: true });
+  }
+}
+
+{
+  const ctxDir = join(outDir, "context-compliance-root-malformed-fixture");
+  rmSync(ctxDir, { recursive: true, force: true });
+  mkdirSync(ctxDir, { recursive: true });
+  writeFileSync(join(ctxDir, "root.json"), "\"not json\"\n");
+  try {
+    const result = json(["context", "compliance", "--json"], { allowFailure: true, env: { ZERO_CONTEXT_DIR: ctxDir } });
+    assert.equal(result.body.ok, false);
+    assert.equal(result.body.diagnostics.length, 1);
+    assert.equal(result.body.diagnostics[0].code, "CTX_COMPLIANCE_ROOT_POINTER_MALFORMED");
+    assert.equal(result.code, 1);
+  } finally {
+    rmSync(ctxDir, { recursive: true, force: true });
+  }
+}
+
+{
+  const ctxDir = join(outDir, "context-compliance-parent-chain-cycle-fixture");
+  const sourceIndexFile = join(ctxDir, "indexes", "source-index.json");
+  const rootA = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+  const rootB = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+  rmSync(ctxDir, { recursive: true, force: true });
+  mkdirSync(ctxDir, { recursive: true });
+  const snapshotA = {
+    schemaVersion: 1,
+    contextRoot: rootA,
+    parentRoot: rootB,
+    reason: "manual",
+    activeNodes: [],
+    nodes: [],
+    supersededNodes: [],
+    archivedNodes: [],
+    createdAt: null,
+    indexes: { sourceIndex: sourceIndexFile },
+  };
+  const snapshotB = { ...snapshotA, contextRoot: rootB, parentRoot: rootA };
+  writeCompliancePointer(ctxDir, rootA);
+  writeComplianceRootSnapshot(ctxDir, snapshotA);
+  writeComplianceRootSnapshot(ctxDir, snapshotB);
+  writeComplianceSourceIndex(ctxDir);
+  try {
+    const result = json(["context", "compliance", "--json"], { allowFailure: true, env: { ZERO_CONTEXT_DIR: ctxDir } });
+    assert.equal(result.body.ok, false);
+    assert.equal(result.body.root.parentChainOk, false);
+    assert.equal(result.body.diagnostics.some((diagnostic) => diagnostic.code === "CTX_COMPLIANCE_PARENT_CHAIN_BROKEN"), true);
+    assert.equal(result.code, 1);
+  } finally {
+    rmSync(ctxDir, { recursive: true, force: true });
+  }
+}
+
+{
+  const ctxDir = join(outDir, "context-compliance-filename-mismatch-fixture");
+  const wrongRoot = "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+  rmSync(ctxDir, { recursive: true, force: true });
+  mkdirSync(ctxDir, { recursive: true });
+  const root = makeComplianceRoot(ctxDir);
+  writeCompliancePointer(ctxDir, wrongRoot);
+  writeComplianceRootSnapshot(ctxDir, root, wrongRoot);
+  writeComplianceSourceIndex(ctxDir);
+  try {
+    const result = json(["context", "compliance", "--json"], { allowFailure: true, env: { ZERO_CONTEXT_DIR: ctxDir } });
+    assert.equal(result.body.ok, false);
+    assert.equal(result.body.root.rootHashOk, false);
+    assert.equal(result.body.diagnostics.some((diagnostic) => diagnostic.code === "CTX_COMPLIANCE_FILENAME_MISMATCH"), true);
+    assert.equal(result.body.diagnostics.some((diagnostic) => diagnostic.code === "CTX_COMPLIANCE_ROOT_HASH_MISMATCH"), true);
+    assert.equal(result.code, 1);
+  } finally {
+    rmSync(ctxDir, { recursive: true, force: true });
+  }
+}
+
+{
+  const ctxDir = join(outDir, "context-compliance-source-index-missing-fixture");
+  rmSync(ctxDir, { recursive: true, force: true });
+  mkdirSync(ctxDir, { recursive: true });
+  const root = makeComplianceRoot(ctxDir);
+  writeCompliancePointer(ctxDir, root.contextRoot);
+  writeComplianceRootSnapshot(ctxDir, root);
+  try {
+    const result = json(["context", "compliance", "--json"], { allowFailure: true, env: { ZERO_CONTEXT_DIR: ctxDir } });
+    assert.equal(result.body.ok, false);
+    assert.equal(result.body.root.rootHashOk, true);
+    assert.equal(result.body.root.parentChainOk, true);
+    assert.equal(result.body.indexes.sourceIndexOk, false);
+    assert.equal(result.body.diagnostics.some((diagnostic) => diagnostic.code === "CTX_COMPLIANCE_SOURCE_INDEX_MISSING"), true);
+    assert.equal(result.code, 1);
+  } finally {
+    rmSync(ctxDir, { recursive: true, force: true });
   }
 }
 

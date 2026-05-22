@@ -199,6 +199,14 @@ char *context_event_path(const char *storage, const char *event_hash) {
   return file;
 }
 
+char *context_source_index_path(const char *storage) {
+  if (!storage) return NULL;
+  char *indexes = context_join_path(storage, "indexes");
+  char *path = context_join_path(indexes, "source-index.json");
+  free(indexes);
+  return path;
+}
+
 bool context_json_get_int(const char *json, const char *name, int *out) {
   const char *cursor = context_json_member_value(json, name);
   if (!cursor || !isdigit((unsigned char)*cursor)) return false;
