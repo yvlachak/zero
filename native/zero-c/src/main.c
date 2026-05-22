@@ -9805,16 +9805,23 @@ static int context_verify_command(const Command *command) {
   return exit_code;
 }
 
-static void context_compliance_append_stub_sections(ZBuf *out, bool source_index_ok) {
+static void context_compliance_append_timeline_section(ZBuf *out, const ContextComplianceTimelineState *timeline) {
+  zbuf_append(out, ",\n  \"timeline\": {\n    \"events\": ");
+  zbuf_appendf(out, "%zu", timeline ? timeline->events : 0);
+  zbuf_append(out, ",\n    \"eventHashesOk\": ");
+  zbuf_append(out, !timeline || timeline->event_hashes_ok ? "true" : "false");
+  zbuf_append(out, ",\n    \"rootReferencesOk\": ");
+  zbuf_append(out, !timeline || timeline->root_references_ok ? "true" : "false");
+  zbuf_append(out, ",\n    \"missingRoots\": ");
+  zbuf_appendf(out, "%zu", timeline ? timeline->missing_roots : 0);
+  zbuf_append(out, ",\n    \"hashFailures\": ");
+  zbuf_appendf(out, "%zu", timeline ? timeline->hash_failures : 0);
+  zbuf_append(out, "\n  }");
+}
+
+static void context_compliance_append_node_anchor_index_stubs(ZBuf *out, bool source_index_ok) {
   zbuf_append(out,
-    ",\n  \"timeline\": {\n"
-    "    \"events\": 0,\n"
-    "    \"eventHashesOk\": true,\n"
-    "    \"rootReferencesOk\": true,\n"
-    "    \"missingRoots\": 0,\n"
-    "    \"hashFailures\": 0\n"
-    "  },\n"
-    "  \"nodes\": {\n"
+    ",\n  \"nodes\": {\n"
     "    \"active\": 0,\n"
     "    \"superseded\": 0,\n"
     "    \"nodeHashesOk\": true,\n"
@@ -9844,6 +9851,10 @@ static int context_compliance_command(const Command *command) {
 
   ContextComplianceRootState root_state;
   context_compliance_read_root(storage, &root_state, &diagnostics, &diagnostic_count);
+
+  ContextComplianceTimelineState timeline_state;
+  context_compliance_timeline_state_init(&timeline_state);
+  context_compliance_read_events(storage, source_option, &timeline_state, &diagnostics, &diagnostic_count);
 
   bool source_index_ok = true;
   char *source_index_path = context_source_index_path(storage);
@@ -9878,7 +9889,8 @@ static int context_compliance_command(const Command *command) {
   zbuf_append(&out, ",\n    \"parentChainOk\": ");
   zbuf_append(&out, root_state.parent_chain_ok ? "true" : "false");
   zbuf_appendf(&out, ",\n    \"rootDepth\": %zu\n  }", root_state.root_depth);
-  context_compliance_append_stub_sections(&out, source_index_ok);
+  context_compliance_append_timeline_section(&out, &timeline_state);
+  context_compliance_append_node_anchor_index_stubs(&out, source_index_ok);
   zbuf_append(&out, ",\n  \"diagnostics\": ");
   if (diagnostic_count > 0) {
     zbuf_append(&out, "[");

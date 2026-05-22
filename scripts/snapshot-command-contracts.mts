@@ -84,6 +84,11 @@ function contextComplianceRootHash(root) {
   return sha256Text(canonicalize(contextComplianceRootPayload(root)));
 }
 
+function contextEventHash(event) {
+  const { eventHash: _eventHash, ...payload } = event;
+  return sha256Text(canonicalize(payload));
+}
+
 function repeatBuildHash(args, firstPath, repeatOut, repeatPath = repeatOut) {
   const repeatArgs = [...args];
   const outIndex = repeatArgs.indexOf("--out");
@@ -621,12 +626,38 @@ function writeComplianceSourceIndex(ctxDir, sources = {}) {
   return sourceIndexFile;
 }
 
+function makeComplianceEvent(sourceFile, previousRoot, currentRoot, eventId = "ctx:event:000001", overrides = {}) {
+  const event = {
+    schemaVersion: 1,
+    kind: "context-event",
+    eventId,
+    eventHash: "sha256:placeholder",
+    mode: "context-check-cycle",
+    sourceFile,
+    previousRoot,
+    currentRoot,
+    rootChanged: true,
+    captured: [],
+    skipped: [],
+    verification: {
+      ok: true,
+      checkedNodes: 0,
+    },
+    diagnostics: [],
+    ...overrides,
+  };
+  event.eventHash = contextEventHash(event);
+  return event;
+}
+
+function writeComplianceEvent(ctxDir, event, filenameHash = event.eventHash) {
+  mkdirSync(join(ctxDir, "events"), { recursive: true });
+  const eventFile = join(ctxDir, "events", `${filenameHash.replace("sha256:", "")}.json`);
+  writeFileSync(eventFile, `${JSON.stringify(event, null, 2)}\n`);
+  return eventFile;
+}
+
 function assertComplianceStubDefaults(body) {
-  assert.equal(body.timeline.events, 0);
-  assert.equal(body.timeline.eventHashesOk, true);
-  assert.equal(body.timeline.rootReferencesOk, true);
-  assert.equal(body.timeline.missingRoots, 0);
-  assert.equal(body.timeline.hashFailures, 0);
   assert.equal(body.nodes.active, 0);
   assert.equal(body.nodes.superseded, 0);
   assert.equal(body.nodes.nodeHashesOk, true);
@@ -873,6 +904,11 @@ function makeVerifyNode(sourceFile, sourceHash, precondition = "let") {
     assert.equal(result.body.root.parentChainOk, true);
     assert.equal(result.body.root.rootDepth, 1);
     assert.equal(result.body.indexes.sourceIndexOk, true);
+    assert.equal(result.body.timeline.events, 0);
+    assert.equal(result.body.timeline.eventHashesOk, true);
+    assert.equal(result.body.timeline.rootReferencesOk, true);
+    assert.equal(result.body.timeline.missingRoots, 0);
+    assert.equal(result.body.timeline.hashFailures, 0);
     assertComplianceStubDefaults(result.body);
     assert.deepEqual(result.body.diagnostics, []);
     assert.equal(result.code, 0);
@@ -994,6 +1030,92 @@ function makeVerifyNode(sourceFile, sourceHash, precondition = "let") {
     assert.equal(result.body.root.parentChainOk, true);
     assert.equal(result.body.indexes.sourceIndexOk, false);
     assert.equal(result.body.diagnostics.some((diagnostic) => diagnostic.code === "CTX_COMPLIANCE_SOURCE_INDEX_MISSING"), true);
+    assert.equal(result.code, 1);
+  } finally {
+    rmSync(ctxDir, { recursive: true, force: true });
+  }
+}
+
+{
+  const ctxDir = join(outDir, "context-compliance-events-clean-fixture");
+  rmSync(ctxDir, { recursive: true, force: true });
+  mkdirSync(ctxDir, { recursive: true });
+  const root = makeComplianceRoot(ctxDir);
+  writeCompliancePointer(ctxDir, root.contextRoot);
+  writeComplianceRootSnapshot(ctxDir, root);
+  writeComplianceSourceIndex(ctxDir);
+  const eventA = makeComplianceEvent("events.0", root.contextRoot, root.contextRoot, "ctx:event:000001");
+  const eventB = makeComplianceEvent("events.0", root.contextRoot, root.contextRoot, "ctx:event:000002");
+  writeComplianceEvent(ctxDir, eventA);
+  writeComplianceEvent(ctxDir, eventB);
+  try {
+    const result = json(["context", "compliance", "--json"], { env: { ZERO_CONTEXT_DIR: ctxDir } });
+    assert.equal(result.body.ok, true);
+    assert.equal(result.body.timeline.events, 2);
+    assert.equal(result.body.timeline.eventHashesOk, true);
+    assert.equal(result.body.timeline.rootReferencesOk, true);
+    assert.equal(result.body.timeline.missingRoots, 0);
+    assert.equal(result.body.timeline.hashFailures, 0);
+    assert.deepEqual(result.body.diagnostics, []);
+    assert.equal(result.code, 0);
+  } finally {
+    rmSync(ctxDir, { recursive: true, force: true });
+  }
+}
+
+{
+  const ctxDir = join(outDir, "context-compliance-events-malformed-fixture");
+  rmSync(ctxDir, { recursive: true, force: true });
+  mkdirSync(ctxDir, { recursive: true });
+  const root = makeComplianceRoot(ctxDir);
+  writeCompliancePointer(ctxDir, root.contextRoot);
+  writeComplianceRootSnapshot(ctxDir, root);
+  writeComplianceSourceIndex(ctxDir);
+  mkdirSync(join(ctxDir, "events"), { recursive: true });
+  writeFileSync(join(ctxDir, "events", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json"), "not json\n");
+  try {
+    const result = json(["context", "compliance", "--json"], { allowFailure: true, env: { ZERO_CONTEXT_DIR: ctxDir } });
+    assert.equal(result.body.ok, false);
+    assert.equal(result.body.timeline.events, 0);
+    assert.equal(result.body.diagnostics.some((diagnostic) => diagnostic.code === "CTX_COMPLIANCE_EVENT_MALFORMED"), true);
+    assert.equal(result.code, 1);
+  } finally {
+    rmSync(ctxDir, { recursive: true, force: true });
+  }
+}
+
+{
+  const ctxDir = join(outDir, "context-compliance-events-hash-mismatch-fixture");
+  rmSync(ctxDir, { recursive: true, force: true });
+  mkdirSync(ctxDir, { recursive: true });
+  const root = makeComplianceRoot(ctxDir);
+  writeCompliancePointer(ctxDir, root.contextRoot);
+  writeComplianceRootSnapshot(ctxDir, root);
+  writeComplianceSourceIndex(ctxDir);
+  const wrongHash = "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+  const event = {
+    schemaVersion: 1,
+    kind: "context-event",
+    eventId: "ctx:event:000001",
+    eventHash: wrongHash,
+    mode: "context-check-cycle",
+    sourceFile: "events.0",
+    previousRoot: root.contextRoot,
+    currentRoot: root.contextRoot,
+    rootChanged: true,
+    captured: [],
+    skipped: [],
+    verification: { ok: true, checkedNodes: 0 },
+    diagnostics: [],
+  };
+  writeComplianceEvent(ctxDir, event, wrongHash);
+  try {
+    const result = json(["context", "compliance", "--json"], { allowFailure: true, env: { ZERO_CONTEXT_DIR: ctxDir } });
+    assert.equal(result.body.ok, false);
+    assert.equal(result.body.timeline.events, 1);
+    assert.equal(result.body.timeline.hashFailures, 1);
+    assert.equal(result.body.timeline.eventHashesOk, false);
+    assert.equal(result.body.diagnostics.some((diagnostic) => diagnostic.code === "CTX_COMPLIANCE_EVENT_HASH_MISMATCH"), true);
     assert.equal(result.code, 1);
   } finally {
     rmSync(ctxDir, { recursive: true, force: true });

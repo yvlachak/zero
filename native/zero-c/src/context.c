@@ -217,6 +217,20 @@ bool context_json_get_int(const char *json, const char *name, int *out) {
   return true;
 }
 
+static bool context_json_get_bool(const char *json, const char *name, bool *out) {
+  const char *cursor = context_json_member_value(json, name);
+  if (!cursor) return false;
+  if (strncmp(cursor, "true", 4) == 0) {
+    if (out) *out = true;
+    return true;
+  }
+  if (strncmp(cursor, "false", 5) == 0) {
+    if (out) *out = false;
+    return true;
+  }
+  return false;
+}
+
 char *context_json_get_string_or_null(const char *json, const char *name, bool *is_null) {
   if (is_null) *is_null = false;
   const char *cursor = context_json_member_value(json, name);
@@ -1169,4 +1183,228 @@ void context_compliance_read_root(
   context_free_string_array(visited, visited_count);
   state->parent_chain_ok = parent_chain_ok && state->current_root_snapshot_json != NULL;
   free(root_path);
+}
+
+void context_compliance_timeline_state_init(ContextComplianceTimelineState *state) {
+  if (!state) return;
+  memset(state, 0, sizeof(*state));
+  state->event_hashes_ok = true;
+  state->root_references_ok = true;
+}
+
+static bool context_json_field_is_object(const char *json, const char *field) {
+  ZBuf raw;
+  zbuf_init(&raw);
+  if (!context_json_emit_field(&raw, json, field)) {
+    zbuf_free(&raw);
+    return false;
+  }
+  const char *cursor = context_json_skip_ws(raw.data);
+  bool ok = cursor && *cursor == '{';
+  zbuf_free(&raw);
+  return ok;
+}
+
+static bool context_event_schema_ok(const char *json) {
+  int schema_version = 0;
+  if (!context_json_get_int(json, "schemaVersion", &schema_version) || schema_version != 1) return false;
+  char *kind = context_json_get_string_or_null(json, "kind", NULL);
+  bool ok = kind && strcmp(kind, "context-event") == 0;
+  free(kind);
+  if (!ok) return false;
+  char *event_id = context_json_get_string_or_null(json, "eventId", NULL);
+  if (!event_id) return false;
+  free(event_id);
+  char *event_hash = context_json_get_string_or_null(json, "eventHash", NULL);
+  if (!event_hash) return false;
+  free(event_hash);
+  char *mode = context_json_get_string_or_null(json, "mode", NULL);
+  ok = mode && (strcmp(mode, "context-check-cycle") == 0 || strcmp(mode, "context-reconcile") == 0);
+  free(mode);
+  if (!ok) return false;
+  char *source_file = context_json_get_string_or_null(json, "sourceFile", NULL);
+  if (!source_file) return false;
+  free(source_file);
+  char *previous_root = context_json_get_string_or_null(json, "previousRoot", NULL);
+  if (!previous_root) return false;
+  free(previous_root);
+  char *current_root = context_json_get_string_or_null(json, "currentRoot", NULL);
+  if (!current_root) return false;
+  free(current_root);
+  bool root_changed = false;
+  if (!context_json_get_bool(json, "rootChanged", &root_changed)) return false;
+  if (!context_json_field_is_array(json, "captured", true)) return false;
+  if (!context_json_field_is_array(json, "skipped", true)) return false;
+  if (!context_json_field_is_object(json, "verification")) return false;
+  ZBuf verification;
+  zbuf_init(&verification);
+  if (!context_json_emit_field(&verification, json, "verification")) {
+    zbuf_free(&verification);
+    return false;
+  }
+  bool verification_ok = false;
+  int checked_nodes = 0;
+  ok = context_json_get_bool(verification.data, "ok", &verification_ok) &&
+       context_json_get_int(verification.data, "checkedNodes", &checked_nodes);
+  zbuf_free(&verification);
+  if (!ok) return false;
+  if (!context_json_field_is_array(json, "diagnostics", true)) return false;
+  return true;
+}
+
+static char *context_event_file_path(const char *storage, const char *filename) {
+  char *events = context_join_path(storage, "events");
+  char *path = context_join_path(events, filename);
+  free(events);
+  return path;
+}
+
+static void context_compliance_check_event_root(
+  const char *storage,
+  const char *root_hash,
+  ContextComplianceTimelineState *state,
+  ZBuf *diagnostics,
+  size_t *diagnostic_count) {
+  char *root_path = context_root_snapshot_path(storage, root_hash);
+  if (!context_path_exists(root_path)) {
+    if (state) state->missing_roots++;
+    context_diagnostic_append(
+      diagnostics,
+      diagnostic_count,
+      NULL,
+      "CTX_COMPLIANCE_EVENT_ROOT_MISSING",
+      "context event references a missing root snapshot",
+      NULL,
+      root_hash,
+      root_path,
+      NULL,
+      NULL);
+  }
+  free(root_path);
+}
+
+void context_compliance_read_events(
+  const char *storage,
+  const char *source_option,
+  ContextComplianceTimelineState *state,
+  ZBuf *diagnostics,
+  size_t *diagnostic_count) {
+  if (!state) return;
+  context_compliance_timeline_state_init(state);
+  size_t filename_count = 0;
+  char **filenames = context_event_filenames(storage, &filename_count);
+  if (!filenames || filename_count == 0) {
+    context_free_string_array(filenames, filename_count);
+    return;
+  }
+  for (size_t i = 0; i < filename_count; i++) {
+    char *event_path = context_event_file_path(storage, filenames[i]);
+    ZDiag read_diag = {0};
+    char *event_json = z_read_file(event_path, &read_diag);
+    if (!event_json) {
+      context_diagnostic_append(
+        diagnostics,
+        diagnostic_count,
+        NULL,
+        "CTX_COMPLIANCE_EVENT_MALFORMED",
+        "context event is not readable",
+        NULL,
+        NULL,
+        event_path,
+        NULL,
+        NULL);
+      free(event_path);
+      continue;
+    }
+    if (!context_json_valid_document(event_json)) {
+      context_diagnostic_append(
+        diagnostics,
+        diagnostic_count,
+        NULL,
+        "CTX_COMPLIANCE_EVENT_MALFORMED",
+        "context event is not valid JSON",
+        NULL,
+        NULL,
+        event_path,
+        NULL,
+        NULL);
+      free(event_json);
+      free(event_path);
+      continue;
+    }
+    if (!context_event_schema_ok(event_json)) {
+      context_diagnostic_append(
+        diagnostics,
+        diagnostic_count,
+        NULL,
+        "CTX_COMPLIANCE_EVENT_MALFORMED",
+        "context event has an unsupported schema",
+        NULL,
+        NULL,
+        event_path,
+        NULL,
+        NULL);
+      free(event_json);
+      free(event_path);
+      continue;
+    }
+    char *source_file = context_json_get_string_or_null(event_json, "sourceFile", NULL);
+    if (source_option && (!source_file || strcmp(source_option, source_file) != 0)) {
+      free(source_file);
+      free(event_json);
+      free(event_path);
+      continue;
+    }
+    free(source_file);
+
+    char *event_hash = context_json_get_string_or_null(event_json, "eventHash", NULL);
+    char *filename_hash = context_snapshot_filename_hash(event_path);
+    const char *event_hash_bare = context_bare_hash(event_hash);
+    if (event_hash_bare && filename_hash && strcmp(filename_hash, event_hash_bare) != 0) {
+      context_diagnostic_append(
+        diagnostics,
+        diagnostic_count,
+        NULL,
+        "CTX_COMPLIANCE_FILENAME_MISMATCH",
+        "event filename does not match its eventHash field",
+        NULL,
+        event_hash_bare,
+        event_path,
+        event_hash_bare,
+        filename_hash);
+    }
+
+    char *computed_hash = context_event_hash(event_json);
+    if (!event_hash || !computed_hash || strcmp(event_hash, computed_hash) != 0) {
+      state->hash_failures++;
+      context_diagnostic_append(
+        diagnostics,
+        diagnostic_count,
+        NULL,
+        "CTX_COMPLIANCE_EVENT_HASH_MISMATCH",
+        "context event hash does not match canonical payload",
+        NULL,
+        NULL,
+        event_path,
+        event_hash,
+        computed_hash);
+    }
+
+    char *previous_root = context_json_get_string_or_null(event_json, "previousRoot", NULL);
+    char *current_root = context_json_get_string_or_null(event_json, "currentRoot", NULL);
+    context_compliance_check_event_root(storage, previous_root, state, diagnostics, diagnostic_count);
+    context_compliance_check_event_root(storage, current_root, state, diagnostics, diagnostic_count);
+    state->events++;
+
+    free(previous_root);
+    free(current_root);
+    free(event_hash);
+    free(filename_hash);
+    free(computed_hash);
+    free(event_json);
+    free(event_path);
+  }
+  context_free_string_array(filenames, filename_count);
+  state->event_hashes_ok = state->hash_failures == 0;
+  state->root_references_ok = state->missing_roots == 0;
 }

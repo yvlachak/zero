@@ -50,10 +50,25 @@ typedef struct {
   size_t root_depth;
 } ContextComplianceRootState;
 
+typedef struct {
+  size_t events;
+  size_t hash_failures;
+  size_t missing_roots;
+  bool event_hashes_ok;
+  bool root_references_ok;
+} ContextComplianceTimelineState;
+
 void context_compliance_root_state_free(ContextComplianceRootState *state);
 void context_compliance_read_root(
   const char *storage,
   ContextComplianceRootState *state,
+  ZBuf *diagnostics,
+  size_t *diagnostic_count);
+void context_compliance_timeline_state_init(ContextComplianceTimelineState *state);
+void context_compliance_read_events(
+  const char *storage,
+  const char *source_option,
+  ContextComplianceTimelineState *state,
   ZBuf *diagnostics,
   size_t *diagnostic_count);
 
