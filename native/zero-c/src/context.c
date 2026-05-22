@@ -548,6 +548,19 @@ char *context_event_hash(const char *event_json) {
   return hash;
 }
 
+char *context_node_hash(const char *node_json) {
+  const char *excluded[] = {"hash", "lifecycle", NULL};
+  ZBuf canonical;
+  zbuf_init(&canonical);
+  if (!context_json_canonicalize_excluding(&canonical, node_json, excluded)) {
+    zbuf_free(&canonical);
+    return NULL;
+  }
+  char *hash = context_prefixed_sha256(canonical.data, canonical.len);
+  zbuf_free(&canonical);
+  return hash;
+}
+
 char *context_node_lifecycle_state(const char *node_json) {
   char *state = context_json_get_nested_string(node_json, "lifecycle", "state", NULL);
   return state ? state : z_strdup("active");
@@ -801,6 +814,11 @@ char **context_root_active_hashes(const char *root_snapshot_json, size_t *out_co
   free(items);
   const char *legacy_fields[] = {"nodes", NULL};
   return context_root_hashes_for_fields(root_snapshot_json, legacy_fields, out_count);
+}
+
+char **context_root_superseded_hashes(const char *root_snapshot_json, size_t *out_count) {
+  const char *superseded_fields[] = {"supersededNodes", NULL};
+  return context_root_hashes_for_fields(root_snapshot_json, superseded_fields, out_count);
 }
 
 char **context_root_all_hashes(const char *root_snapshot_json, size_t *out_count) {
@@ -1407,4 +1425,258 @@ void context_compliance_read_events(
   context_free_string_array(filenames, filename_count);
   state->event_hashes_ok = state->hash_failures == 0;
   state->root_references_ok = state->missing_roots == 0;
+}
+
+void context_compliance_node_state_init(ContextComplianceNodeState *state) {
+  if (!state) return;
+  memset(state, 0, sizeof(*state));
+  state->node_hashes_ok = true;
+  state->lifecycle_ok = true;
+}
+
+void context_compliance_node_state_free(ContextComplianceNodeState *state) {
+  if (!state) return;
+  context_free_string_array(state->active_node_anchor_paths, state->active_node_anchor_count);
+  context_free_string_array(state->active_node_anchor_hashes, state->active_node_anchor_count);
+  memset(state, 0, sizeof(*state));
+}
+
+static bool context_node_minimum_schema_ok(const char *node_json) {
+  char *node_id = context_json_get_string_or_null(node_json, "nodeId", NULL);
+  char *hash = context_json_get_string_or_null(node_json, "hash", NULL);
+  bool ok = node_id && hash;
+  free(node_id);
+  free(hash);
+  return ok;
+}
+
+static void context_compliance_append_anchor_pair(ContextComplianceNodeState *state, char *anchor_path, const char *hash) {
+  if (!state || !anchor_path || !hash) {
+    free(anchor_path);
+    return;
+  }
+  size_t count = state->active_node_anchor_count;
+  state->active_node_anchor_paths = z_checked_reallocarray(state->active_node_anchor_paths, count + 1, sizeof(char *));
+  state->active_node_anchor_hashes = z_checked_reallocarray(state->active_node_anchor_hashes, count + 1, sizeof(char *));
+  state->active_node_anchor_paths[count] = anchor_path;
+  state->active_node_anchor_hashes[count] = z_strdup(hash);
+  state->active_node_anchor_count++;
+}
+
+static void context_compliance_check_node_filename(
+  const char *node_path,
+  const char *node_hash_field,
+  ZBuf *diagnostics,
+  size_t *diagnostic_count) {
+  char *filename_hash = context_snapshot_filename_hash(node_path);
+  const char *node_hash_bare = context_bare_hash(node_hash_field);
+  if (node_hash_bare && filename_hash && strcmp(filename_hash, node_hash_bare) != 0) {
+    context_diagnostic_append(
+      diagnostics,
+      diagnostic_count,
+      NULL,
+      "CTX_COMPLIANCE_FILENAME_MISMATCH",
+      "node filename does not match its hash field",
+      NULL,
+      node_hash_bare,
+      node_path,
+      node_hash_bare,
+      filename_hash);
+  }
+  free(filename_hash);
+}
+
+static char *context_compliance_read_node_json(
+  const char *storage,
+  const char *hash,
+  const char *missing_code,
+  const char *missing_message,
+  bool *ok_flag,
+  ZBuf *diagnostics,
+  size_t *diagnostic_count,
+  char **out_path) {
+  char *node_path = context_node_path(storage, hash);
+  if (out_path) *out_path = node_path;
+  if (!context_path_exists(node_path)) {
+    if (ok_flag) *ok_flag = false;
+    context_diagnostic_append(diagnostics, diagnostic_count, NULL, missing_code, missing_message, NULL, hash, node_path, NULL, NULL);
+    if (!out_path) free(node_path);
+    return NULL;
+  }
+  ZDiag read_diag = {0};
+  char *node_json = z_read_file(node_path, &read_diag);
+  if (!node_json) {
+    if (ok_flag) *ok_flag = false;
+    context_diagnostic_append(diagnostics, diagnostic_count, NULL, "CTX_COMPLIANCE_NODE_MALFORMED", "context node is not readable", NULL, hash, node_path, NULL, NULL);
+    if (!out_path) free(node_path);
+    return NULL;
+  }
+  if (!context_json_valid_document(node_json)) {
+    if (ok_flag) *ok_flag = false;
+    context_diagnostic_append(diagnostics, diagnostic_count, NULL, "CTX_COMPLIANCE_NODE_MALFORMED", "context node is not valid JSON", NULL, hash, node_path, NULL, NULL);
+    free(node_json);
+    if (!out_path) free(node_path);
+    return NULL;
+  }
+  if (!context_node_minimum_schema_ok(node_json)) {
+    if (ok_flag) *ok_flag = false;
+    context_diagnostic_append(diagnostics, diagnostic_count, NULL, "CTX_COMPLIANCE_NODE_MALFORMED", "context node has an unsupported schema", NULL, hash, node_path, NULL, NULL);
+    free(node_json);
+    if (!out_path) free(node_path);
+    return NULL;
+  }
+  if (!out_path) free(node_path);
+  return node_json;
+}
+
+static char *context_node_anchor_path(const char *node_json) {
+  ZBuf anchor;
+  zbuf_init(&anchor);
+  if (!context_json_emit_field(&anchor, node_json, "sourceAnchor")) {
+    zbuf_free(&anchor);
+    return NULL;
+  }
+  char *path = context_json_get_string_or_null(anchor.data, "path", NULL);
+  zbuf_free(&anchor);
+  return path;
+}
+
+static char *context_compliance_effective_lifecycle(
+  const char *node_json,
+  const char *node_id,
+  const char *hash,
+  const char *node_path,
+  ZBuf *diagnostics,
+  size_t *diagnostic_count) {
+  char *raw_state = context_json_get_nested_string(node_json, "lifecycle", "state", NULL);
+  if (raw_state) return raw_state;
+  context_diagnostic_append(
+    diagnostics,
+    diagnostic_count,
+    "warning",
+    "CTX_NODE_LIFECYCLE_MISSING",
+    "node lifecycle defaulted to active",
+    node_id,
+    hash,
+    node_path,
+    NULL,
+    NULL);
+  return z_strdup("active");
+}
+
+void context_compliance_read_nodes(
+  const char *storage,
+  const char *root_snapshot_json,
+  ContextComplianceNodeState *state,
+  ZBuf *diagnostics,
+  size_t *diagnostic_count) {
+  if (!state) return;
+  context_compliance_node_state_init(state);
+  if (!root_snapshot_json) return;
+
+  size_t active_count = 0;
+  char **active_hashes = context_root_active_hashes(root_snapshot_json, &active_count);
+  for (size_t i = 0; i < active_count; i++) {
+    char *node_path = NULL;
+    char *node_json = context_compliance_read_node_json(
+      storage,
+      active_hashes[i],
+      "CTX_COMPLIANCE_NODE_MISSING",
+      "active context node does not exist",
+      &state->node_hashes_ok,
+      diagnostics,
+      diagnostic_count,
+      &node_path);
+    if (!node_json) {
+      free(node_path);
+      continue;
+    }
+    char *node_id = context_json_get_string_or_null(node_json, "nodeId", NULL);
+    char *node_hash_field = context_json_get_string_or_null(node_json, "hash", NULL);
+    state->active++;
+    context_compliance_check_node_filename(node_path, node_hash_field, diagnostics, diagnostic_count);
+    char *computed_hash = context_node_hash(node_json);
+    if (!node_hash_field || !computed_hash || strcmp(node_hash_field, active_hashes[i]) != 0 || strcmp(node_hash_field, computed_hash) != 0) {
+      state->node_hashes_ok = false;
+      context_diagnostic_append(
+        diagnostics,
+        diagnostic_count,
+        NULL,
+        "CTX_COMPLIANCE_NODE_HASH_MISMATCH",
+        "context node hash does not match canonical payload",
+        node_id,
+        active_hashes[i],
+        node_path,
+        node_hash_field,
+        computed_hash);
+    }
+    char *lifecycle_state = context_compliance_effective_lifecycle(node_json, node_id, active_hashes[i], node_path, diagnostics, diagnostic_count);
+    if (!lifecycle_state || strcmp(lifecycle_state, "active") != 0) {
+      state->lifecycle_ok = false;
+      context_diagnostic_append(
+        diagnostics,
+        diagnostic_count,
+        NULL,
+        "CTX_COMPLIANCE_ACTIVE_NODE_SUPERSEDED",
+        "active root entry points to a superseded node",
+        node_id,
+        active_hashes[i],
+        node_path,
+        NULL,
+        NULL);
+    }
+    char *anchor_path = context_node_anchor_path(node_json);
+    if (anchor_path) context_compliance_append_anchor_pair(state, anchor_path, active_hashes[i]);
+    free(lifecycle_state);
+    free(computed_hash);
+    free(node_hash_field);
+    free(node_id);
+    free(node_json);
+    free(node_path);
+  }
+
+  size_t superseded_count = 0;
+  char **superseded_hashes = context_root_superseded_hashes(root_snapshot_json, &superseded_count);
+  for (size_t i = 0; i < superseded_count; i++) {
+    char *node_path = NULL;
+    char *node_json = context_compliance_read_node_json(
+      storage,
+      superseded_hashes[i],
+      "CTX_COMPLIANCE_SUPERSEDED_NODE_MISSING",
+      "superseded context node does not exist",
+      &state->lifecycle_ok,
+      diagnostics,
+      diagnostic_count,
+      &node_path);
+    if (!node_json) {
+      free(node_path);
+      continue;
+    }
+    char *node_id = context_json_get_string_or_null(node_json, "nodeId", NULL);
+    char *node_hash_field = context_json_get_string_or_null(node_json, "hash", NULL);
+    state->superseded++;
+    context_compliance_check_node_filename(node_path, node_hash_field, diagnostics, diagnostic_count);
+    char *lifecycle_state = context_compliance_effective_lifecycle(node_json, node_id, superseded_hashes[i], node_path, diagnostics, diagnostic_count);
+    if (lifecycle_state && strcmp(lifecycle_state, "active") == 0) {
+      state->lifecycle_ok = false;
+      context_diagnostic_append(
+        diagnostics,
+        diagnostic_count,
+        NULL,
+        "CTX_COMPLIANCE_SUPERSEDED_NODE_ACTIVE",
+        "superseded root entry points to an active node",
+        node_id,
+        superseded_hashes[i],
+        node_path,
+        NULL,
+        NULL);
+    }
+    free(lifecycle_state);
+    free(node_hash_field);
+    free(node_id);
+    free(node_json);
+    free(node_path);
+  }
+  context_free_string_array(active_hashes, active_count);
+  context_free_string_array(superseded_hashes, superseded_count);
 }

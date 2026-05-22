@@ -9819,15 +9819,21 @@ static void context_compliance_append_timeline_section(ZBuf *out, const ContextC
   zbuf_append(out, "\n  }");
 }
 
-static void context_compliance_append_node_anchor_index_stubs(ZBuf *out, bool source_index_ok) {
+static void context_compliance_append_nodes_section(ZBuf *out, const ContextComplianceNodeState *nodes) {
+  zbuf_append(out, ",\n  \"nodes\": {\n    \"active\": ");
+  zbuf_appendf(out, "%zu", nodes ? nodes->active : 0);
+  zbuf_append(out, ",\n    \"superseded\": ");
+  zbuf_appendf(out, "%zu", nodes ? nodes->superseded : 0);
+  zbuf_append(out, ",\n    \"nodeHashesOk\": ");
+  zbuf_append(out, !nodes || nodes->node_hashes_ok ? "true" : "false");
+  zbuf_append(out, ",\n    \"lifecycleOk\": ");
+  zbuf_append(out, !nodes || nodes->lifecycle_ok ? "true" : "false");
+  zbuf_append(out, "\n  }");
+}
+
+static void context_compliance_append_anchor_index_stubs(ZBuf *out, bool source_index_ok) {
   zbuf_append(out,
-    ",\n  \"nodes\": {\n"
-    "    \"active\": 0,\n"
-    "    \"superseded\": 0,\n"
-    "    \"nodeHashesOk\": true,\n"
-    "    \"lifecycleOk\": true\n"
-    "  },\n"
-    "  \"anchors\": {\n"
+    ",\n  \"anchors\": {\n"
     "    \"checked\": 0,\n"
     "    \"ok\": true\n"
     "  },\n"
@@ -9855,6 +9861,12 @@ static int context_compliance_command(const Command *command) {
   ContextComplianceTimelineState timeline_state;
   context_compliance_timeline_state_init(&timeline_state);
   context_compliance_read_events(storage, source_option, &timeline_state, &diagnostics, &diagnostic_count);
+
+  ContextComplianceNodeState node_state;
+  context_compliance_node_state_init(&node_state);
+  if (root_state.current_root_snapshot_json) {
+    context_compliance_read_nodes(storage, root_state.current_root_snapshot_json, &node_state, &diagnostics, &diagnostic_count);
+  }
 
   bool source_index_ok = true;
   char *source_index_path = context_source_index_path(storage);
@@ -9890,7 +9902,8 @@ static int context_compliance_command(const Command *command) {
   zbuf_append(&out, root_state.parent_chain_ok ? "true" : "false");
   zbuf_appendf(&out, ",\n    \"rootDepth\": %zu\n  }", root_state.root_depth);
   context_compliance_append_timeline_section(&out, &timeline_state);
-  context_compliance_append_node_anchor_index_stubs(&out, source_index_ok);
+  context_compliance_append_nodes_section(&out, &node_state);
+  context_compliance_append_anchor_index_stubs(&out, source_index_ok);
   zbuf_append(&out, ",\n  \"diagnostics\": ");
   if (diagnostic_count > 0) {
     zbuf_append(&out, "[");
@@ -9904,6 +9917,7 @@ static int context_compliance_command(const Command *command) {
 
   zbuf_free(&out);
   zbuf_free(&diagnostics);
+  context_compliance_node_state_free(&node_state);
   context_compliance_root_state_free(&root_state);
   free(source_index_path);
   return ok ? 0 : 1;

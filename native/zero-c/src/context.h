@@ -14,6 +14,7 @@ char *context_event_path(const char *storage, const char *event_hash);
 char *context_source_index_path(const char *storage);
 char **context_event_filenames(const char *storage, size_t *out_count);
 char *context_event_hash(const char *event_json);
+char *context_node_hash(const char *node_json);
 char *context_node_lifecycle_state(const char *node_json);
 char *context_root_payload_hash(const char *root_snapshot_json);
 
@@ -58,6 +59,16 @@ typedef struct {
   bool root_references_ok;
 } ContextComplianceTimelineState;
 
+typedef struct {
+  size_t active;
+  size_t superseded;
+  bool node_hashes_ok;
+  bool lifecycle_ok;
+  char **active_node_anchor_paths;
+  char **active_node_anchor_hashes;
+  size_t active_node_anchor_count;
+} ContextComplianceNodeState;
+
 void context_compliance_root_state_free(ContextComplianceRootState *state);
 void context_compliance_read_root(
   const char *storage,
@@ -69,6 +80,14 @@ void context_compliance_read_events(
   const char *storage,
   const char *source_option,
   ContextComplianceTimelineState *state,
+  ZBuf *diagnostics,
+  size_t *diagnostic_count);
+void context_compliance_node_state_init(ContextComplianceNodeState *state);
+void context_compliance_node_state_free(ContextComplianceNodeState *state);
+void context_compliance_read_nodes(
+  const char *storage,
+  const char *root_snapshot_json,
+  ContextComplianceNodeState *state,
   ZBuf *diagnostics,
   size_t *diagnostic_count);
 
@@ -84,6 +103,7 @@ char **context_source_index_all_hashes(const char *storage, size_t *out_count);
 char *context_read_node(const char *storage, const char *hash);
 char *context_read_root_snapshot(const char *storage, const char *current_root);
 char **context_root_active_hashes(const char *root_snapshot_json, size_t *out_count);
+char **context_root_superseded_hashes(const char *root_snapshot_json, size_t *out_count);
 char **context_root_all_hashes(const char *root_snapshot_json, size_t *out_count);
 
 #endif

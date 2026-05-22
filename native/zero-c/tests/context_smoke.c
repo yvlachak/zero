@@ -178,6 +178,89 @@ static void cleanup_events_storage(const char *base, const char **event_paths, s
   rmdir(base);
 }
 
+static void append_json_string_array(ZBuf *json, const char **items, size_t count) {
+  zbuf_append_char(json, '[');
+  for (size_t i = 0; i < count; i++) {
+    if (i > 0) zbuf_append_char(json, ',');
+    zbuf_append_char(json, '"');
+    zbuf_append(json, items[i]);
+    zbuf_append_char(json, '"');
+  }
+  zbuf_append_char(json, ']');
+}
+
+static char *node_root_snapshot_json(const char **active, size_t active_count, const char **superseded, size_t superseded_count) {
+  ZBuf json;
+  zbuf_init(&json);
+  zbuf_append(&json, "{\"schemaVersion\":1,\"contextRoot\":\"sha256:root\",\"parentRoot\":null,\"reason\":\"manual\",\"activeNodes\":");
+  append_json_string_array(&json, active, active_count);
+  zbuf_append(&json, ",\"nodes\":");
+  append_json_string_array(&json, active, active_count);
+  zbuf_append(&json, ",\"supersededNodes\":");
+  append_json_string_array(&json, superseded, superseded_count);
+  zbuf_append(&json, ",\"archivedNodes\":[],\"createdAt\":null,\"indexes\":{\"sourceIndex\":\".zero/context/indexes/source-index.json\"}}");
+  return json.data;
+}
+
+static char *node_json(const char *node_id, const char *hash, const char *anchor_path, const char *lifecycle_state) {
+  ZBuf json;
+  zbuf_init(&json);
+  zbuf_append(&json, "{\"schemaVersion\":1,\"kind\":\"repair-memory\",\"nodeId\":\"");
+  zbuf_append(&json, node_id);
+  zbuf_append(&json, "\",\"hash\":\"");
+  zbuf_append(&json, hash);
+  zbuf_append(&json, "\",\"parents\":[],\"codes\":[],\"diagnosticCode\":\"TYP009\",\"repairId\":\"make-binding-mutable\",\"residualSummary\":\"test\",\"projection\":{\"kind\":\"context-projection\",\"frontier\":{\"diagnostics\":[],\"repairs\":[],\"edits\":[]}}");
+  if (anchor_path) {
+    zbuf_append(&json, ",\"sourceAnchor\":{\"path\":\"");
+    zbuf_append(&json, anchor_path);
+    zbuf_append(&json, "\",\"range\":{\"startLine\":1,\"startCol\":1,\"endLine\":1,\"endCol\":2},\"sourceHash\":null,\"status\":\"active\"}");
+  }
+  if (lifecycle_state) {
+    zbuf_append(&json, ",\"lifecycle\":{\"state\":\"");
+    zbuf_append(&json, lifecycle_state);
+    zbuf_append(&json, "\",\"supersedes\":[],\"supersededBy\":null}");
+  }
+  zbuf_append_char(&json, '}');
+  return json.data;
+}
+
+static char *valid_node_json(const char *node_id, const char *anchor_path, const char *lifecycle_state, char **out_node_hash) {
+  char *draft = node_json(node_id, "sha256:placeholder", anchor_path, lifecycle_state);
+  char *hash = context_node_hash(draft);
+  free(draft);
+  ASSERT(hash != NULL, "compute node hash");
+  char *node = node_json(node_id, hash, anchor_path, lifecycle_state);
+  if (out_node_hash) *out_node_hash = hash;
+  else free(hash);
+  return node;
+}
+
+static void make_node_storage_dirs(const char *base, char *storage, size_t storage_len, char *nodes, size_t nodes_len) {
+  snprintf(storage, storage_len, "%s/storage", base);
+  snprintf(nodes, nodes_len, "%s/nodes", storage);
+  ASSERT(mkdir(base, 0700) == 0, "mkdir node base");
+  ASSERT(mkdir(storage, 0700) == 0, "mkdir node storage");
+  ASSERT(mkdir(nodes, 0700) == 0, "mkdir nodes");
+}
+
+static char *write_node_at(const char *storage, const char *hash, const char *content) {
+  char *path = context_node_path(storage, hash);
+  write_text_file(path, content);
+  return path;
+}
+
+static void cleanup_node_storage(const char *base, const char **node_paths, size_t node_count) {
+  for (size_t i = 0; i < node_count; i++) {
+    if (node_paths[i]) unlink(node_paths[i]);
+  }
+  char path[256];
+  snprintf(path, sizeof(path), "%s/storage/nodes", base);
+  rmdir(path);
+  snprintf(path, sizeof(path), "%s/storage", base);
+  rmdir(path);
+  rmdir(base);
+}
+
 static void lifecycle_defaults_to_active_when_absent(void) {
   char *state = context_node_lifecycle_state("{\"nodeId\":\"x\"}");
   expect_string(state, "active", "missing lifecycle defaults active");
@@ -738,6 +821,216 @@ static void compliance_events_source_filter(void) {
   free(event_path_b);
 }
 
+static void compliance_nodes_clean(void) {
+  char base[128], storage[160], nodes[192];
+  snprintf(base, sizeof(base), "/tmp/zero-context-smoke-%ld-nodes1", (long)getpid());
+  make_node_storage_dirs(base, storage, sizeof(storage), nodes, sizeof(nodes));
+  char *active_hash_a = NULL, *active_hash_b = NULL, *superseded_hash = NULL;
+  char *active_a = valid_node_json("ctx:node:active-a", "a.0", "active", &active_hash_a);
+  char *active_b = valid_node_json("ctx:node:active-b", "b.0", "active", &active_hash_b);
+  char *superseded = valid_node_json("ctx:node:superseded", NULL, "superseded", &superseded_hash);
+  char *path_a = write_node_at(storage, active_hash_a, active_a);
+  char *path_b = write_node_at(storage, active_hash_b, active_b);
+  char *path_s = write_node_at(storage, superseded_hash, superseded);
+  const char *active_hashes[] = {active_hash_a, active_hash_b};
+  const char *superseded_hashes[] = {superseded_hash};
+  char *snapshot = node_root_snapshot_json(active_hashes, 2, superseded_hashes, 1);
+  ZBuf diagnostics; zbuf_init(&diagnostics);
+  size_t diagnostic_count = 0;
+  ContextComplianceNodeState state;
+  context_compliance_read_nodes(storage, snapshot, &state, &diagnostics, &diagnostic_count);
+  ASSERT(state.active == 2, "clean active node count");
+  ASSERT(state.superseded == 1, "clean superseded node count");
+  ASSERT(state.node_hashes_ok, "clean node hashes ok");
+  ASSERT(state.lifecycle_ok, "clean lifecycle ok");
+  ASSERT(state.active_node_anchor_count == 2, "clean anchor pair count");
+  ASSERT(diagnostic_count == 0, "clean node diagnostics");
+  context_compliance_node_state_free(&state);
+  zbuf_free(&diagnostics);
+  const char *paths[] = {path_a, path_b, path_s};
+  cleanup_node_storage(base, paths, 3);
+  free(active_hash_a); free(active_hash_b); free(superseded_hash);
+  free(active_a); free(active_b); free(superseded); free(snapshot);
+  free(path_a); free(path_b); free(path_s);
+}
+
+static void compliance_nodes_active_missing(void) {
+  char base[128], storage[160], nodes[192];
+  snprintf(base, sizeof(base), "/tmp/zero-context-smoke-%ld-nodes2", (long)getpid());
+  make_node_storage_dirs(base, storage, sizeof(storage), nodes, sizeof(nodes));
+  const char *missing = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+  const char *active_hashes[] = {missing};
+  char *snapshot = node_root_snapshot_json(active_hashes, 1, NULL, 0);
+  ZBuf diagnostics; zbuf_init(&diagnostics);
+  size_t diagnostic_count = 0;
+  ContextComplianceNodeState state;
+  context_compliance_read_nodes(storage, snapshot, &state, &diagnostics, &diagnostic_count);
+  ASSERT(state.active == 0, "missing active not counted");
+  ASSERT(!state.node_hashes_ok, "missing active hashes false");
+  ASSERT(strstr(diagnostics.data, "\"code\":\"CTX_COMPLIANCE_NODE_MISSING\"") != NULL, "missing active diagnostic");
+  context_compliance_node_state_free(&state);
+  zbuf_free(&diagnostics);
+  cleanup_node_storage(base, NULL, 0);
+  free(snapshot);
+}
+
+static void compliance_nodes_malformed(void) {
+  char base[128], storage[160], nodes[192];
+  snprintf(base, sizeof(base), "/tmp/zero-context-smoke-%ld-nodes3", (long)getpid());
+  make_node_storage_dirs(base, storage, sizeof(storage), nodes, sizeof(nodes));
+  const char *hash = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+  char *path = write_node_at(storage, hash, "not json");
+  const char *active_hashes[] = {hash};
+  char *snapshot = node_root_snapshot_json(active_hashes, 1, NULL, 0);
+  ZBuf diagnostics; zbuf_init(&diagnostics);
+  size_t diagnostic_count = 0;
+  ContextComplianceNodeState state;
+  context_compliance_read_nodes(storage, snapshot, &state, &diagnostics, &diagnostic_count);
+  ASSERT(state.active == 0, "malformed active not counted");
+  ASSERT(!state.node_hashes_ok, "malformed node hashes false");
+  ASSERT(strstr(diagnostics.data, "\"code\":\"CTX_COMPLIANCE_NODE_MALFORMED\"") != NULL, "malformed node diagnostic");
+  context_compliance_node_state_free(&state);
+  zbuf_free(&diagnostics);
+  const char *paths[] = {path};
+  cleanup_node_storage(base, paths, 1);
+  free(path); free(snapshot);
+}
+
+static void compliance_nodes_hash_mismatch(void) {
+  char base[128], storage[160], nodes[192];
+  snprintf(base, sizeof(base), "/tmp/zero-context-smoke-%ld-nodes4", (long)getpid());
+  make_node_storage_dirs(base, storage, sizeof(storage), nodes, sizeof(nodes));
+  const char *wrong_hash = "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+  char *node = node_json("ctx:node:hash-mismatch", wrong_hash, NULL, "active");
+  char *path = write_node_at(storage, wrong_hash, node);
+  const char *active_hashes[] = {wrong_hash};
+  char *snapshot = node_root_snapshot_json(active_hashes, 1, NULL, 0);
+  ZBuf diagnostics; zbuf_init(&diagnostics);
+  size_t diagnostic_count = 0;
+  ContextComplianceNodeState state;
+  context_compliance_read_nodes(storage, snapshot, &state, &diagnostics, &diagnostic_count);
+  ASSERT(state.active == 1, "hash mismatch active counted");
+  ASSERT(!state.node_hashes_ok, "hash mismatch hashes false");
+  ASSERT(strstr(diagnostics.data, "\"code\":\"CTX_COMPLIANCE_NODE_HASH_MISMATCH\"") != NULL, "hash mismatch diagnostic");
+  context_compliance_node_state_free(&state);
+  zbuf_free(&diagnostics);
+  const char *paths[] = {path};
+  cleanup_node_storage(base, paths, 1);
+  free(node); free(path); free(snapshot);
+}
+
+static void compliance_nodes_active_superseded(void) {
+  char base[128], storage[160], nodes[192];
+  snprintf(base, sizeof(base), "/tmp/zero-context-smoke-%ld-nodes5", (long)getpid());
+  make_node_storage_dirs(base, storage, sizeof(storage), nodes, sizeof(nodes));
+  char *hash = NULL;
+  char *node = valid_node_json("ctx:node:active-superseded", NULL, "superseded", &hash);
+  char *path = write_node_at(storage, hash, node);
+  const char *active_hashes[] = {hash};
+  char *snapshot = node_root_snapshot_json(active_hashes, 1, NULL, 0);
+  ZBuf diagnostics; zbuf_init(&diagnostics);
+  size_t diagnostic_count = 0;
+  ContextComplianceNodeState state;
+  context_compliance_read_nodes(storage, snapshot, &state, &diagnostics, &diagnostic_count);
+  ASSERT(!state.lifecycle_ok, "active superseded lifecycle false");
+  ASSERT(strstr(diagnostics.data, "\"code\":\"CTX_COMPLIANCE_ACTIVE_NODE_SUPERSEDED\"") != NULL, "active superseded diagnostic");
+  context_compliance_node_state_free(&state);
+  zbuf_free(&diagnostics);
+  const char *paths[] = {path};
+  cleanup_node_storage(base, paths, 1);
+  free(hash); free(node); free(path); free(snapshot);
+}
+
+static void compliance_nodes_lifecycle_missing(void) {
+  char base[128], storage[160], nodes[192];
+  snprintf(base, sizeof(base), "/tmp/zero-context-smoke-%ld-nodes6", (long)getpid());
+  make_node_storage_dirs(base, storage, sizeof(storage), nodes, sizeof(nodes));
+  char *hash = NULL;
+  char *node = valid_node_json("ctx:node:lifecycle-missing", NULL, NULL, &hash);
+  char *path = write_node_at(storage, hash, node);
+  const char *active_hashes[] = {hash};
+  char *snapshot = node_root_snapshot_json(active_hashes, 1, NULL, 0);
+  ZBuf diagnostics; zbuf_init(&diagnostics);
+  size_t diagnostic_count = 0;
+  ContextComplianceNodeState state;
+  context_compliance_read_nodes(storage, snapshot, &state, &diagnostics, &diagnostic_count);
+  ASSERT(state.active == 1, "missing lifecycle active counted");
+  ASSERT(state.lifecycle_ok, "missing lifecycle warning keeps lifecycle ok");
+  ASSERT(strstr(diagnostics.data, "\"code\":\"CTX_NODE_LIFECYCLE_MISSING\"") != NULL, "missing lifecycle diagnostic");
+  ASSERT(strstr(diagnostics.data, "\"severity\":\"warning\"") != NULL, "missing lifecycle warning");
+  context_compliance_node_state_free(&state);
+  zbuf_free(&diagnostics);
+  const char *paths[] = {path};
+  cleanup_node_storage(base, paths, 1);
+  free(hash); free(node); free(path); free(snapshot);
+}
+
+static void compliance_nodes_filename_mismatch(void) {
+  char base[128], storage[160], nodes[192];
+  snprintf(base, sizeof(base), "/tmp/zero-context-smoke-%ld-nodes7", (long)getpid());
+  make_node_storage_dirs(base, storage, sizeof(storage), nodes, sizeof(nodes));
+  char *hash = NULL;
+  char *node = valid_node_json("ctx:node:filename-mismatch", NULL, "active", &hash);
+  const char *wrong_hash = "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+  char *path = write_node_at(storage, wrong_hash, node);
+  const char *active_hashes[] = {wrong_hash};
+  char *snapshot = node_root_snapshot_json(active_hashes, 1, NULL, 0);
+  ZBuf diagnostics; zbuf_init(&diagnostics);
+  size_t diagnostic_count = 0;
+  ContextComplianceNodeState state;
+  context_compliance_read_nodes(storage, snapshot, &state, &diagnostics, &diagnostic_count);
+  ASSERT(strstr(diagnostics.data, "\"code\":\"CTX_COMPLIANCE_FILENAME_MISMATCH\"") != NULL, "node filename mismatch diagnostic");
+  ASSERT(strstr(diagnostics.data, "\"code\":\"CTX_COMPLIANCE_NODE_HASH_MISMATCH\"") != NULL, "node filename hash mismatch diagnostic");
+  context_compliance_node_state_free(&state);
+  zbuf_free(&diagnostics);
+  const char *paths[] = {path};
+  cleanup_node_storage(base, paths, 1);
+  free(hash); free(node); free(path); free(snapshot);
+}
+
+static void compliance_nodes_superseded_active(void) {
+  char base[128], storage[160], nodes[192];
+  snprintf(base, sizeof(base), "/tmp/zero-context-smoke-%ld-nodes8", (long)getpid());
+  make_node_storage_dirs(base, storage, sizeof(storage), nodes, sizeof(nodes));
+  char *hash = NULL;
+  char *node = valid_node_json("ctx:node:superseded-active", NULL, "active", &hash);
+  char *path = write_node_at(storage, hash, node);
+  const char *superseded_hashes[] = {hash};
+  char *snapshot = node_root_snapshot_json(NULL, 0, superseded_hashes, 1);
+  ZBuf diagnostics; zbuf_init(&diagnostics);
+  size_t diagnostic_count = 0;
+  ContextComplianceNodeState state;
+  context_compliance_read_nodes(storage, snapshot, &state, &diagnostics, &diagnostic_count);
+  ASSERT(state.superseded == 1, "superseded active counted");
+  ASSERT(!state.lifecycle_ok, "superseded active lifecycle false");
+  ASSERT(strstr(diagnostics.data, "\"code\":\"CTX_COMPLIANCE_SUPERSEDED_NODE_ACTIVE\"") != NULL, "superseded active diagnostic");
+  context_compliance_node_state_free(&state);
+  zbuf_free(&diagnostics);
+  const char *paths[] = {path};
+  cleanup_node_storage(base, paths, 1);
+  free(hash); free(node); free(path); free(snapshot);
+}
+
+static void compliance_nodes_superseded_missing(void) {
+  char base[128], storage[160], nodes[192];
+  snprintf(base, sizeof(base), "/tmp/zero-context-smoke-%ld-nodes9", (long)getpid());
+  make_node_storage_dirs(base, storage, sizeof(storage), nodes, sizeof(nodes));
+  const char *missing = "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+  const char *superseded_hashes[] = {missing};
+  char *snapshot = node_root_snapshot_json(NULL, 0, superseded_hashes, 1);
+  ZBuf diagnostics; zbuf_init(&diagnostics);
+  size_t diagnostic_count = 0;
+  ContextComplianceNodeState state;
+  context_compliance_read_nodes(storage, snapshot, &state, &diagnostics, &diagnostic_count);
+  ASSERT(state.superseded == 0, "missing superseded not counted");
+  ASSERT(!state.lifecycle_ok, "missing superseded lifecycle false");
+  ASSERT(strstr(diagnostics.data, "\"code\":\"CTX_COMPLIANCE_SUPERSEDED_NODE_MISSING\"") != NULL, "missing superseded diagnostic");
+  context_compliance_node_state_free(&state);
+  zbuf_free(&diagnostics);
+  cleanup_node_storage(base, NULL, 0);
+  free(snapshot);
+}
+
 int main(void) {
   lifecycle_defaults_to_active_when_absent();
   lifecycle_defaults_to_active_when_state_absent();
@@ -761,6 +1054,15 @@ int main(void) {
   compliance_events_root_missing();
   compliance_events_filename_mismatch();
   compliance_events_source_filter();
+  compliance_nodes_clean();
+  compliance_nodes_active_missing();
+  compliance_nodes_malformed();
+  compliance_nodes_hash_mismatch();
+  compliance_nodes_active_superseded();
+  compliance_nodes_lifecycle_missing();
+  compliance_nodes_filename_mismatch();
+  compliance_nodes_superseded_active();
+  compliance_nodes_superseded_missing();
   printf("context smoke ok\n");
   return 0;
 }
