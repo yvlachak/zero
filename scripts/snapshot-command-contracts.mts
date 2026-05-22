@@ -692,6 +692,45 @@ function makeComplianceNode(nodeId, lifecycleState = "active", anchorPath = null
   return node;
 }
 
+function makeComplianceAnchorNode(nodeId, sourceFile, sourceHash = null, precondition = "let") {
+  const node = {
+    schemaVersion: 1,
+    kind: "repair-memory",
+    nodeId,
+    parents: [],
+    codes: [],
+    diagnosticCode: "TYP009",
+    repairId: "make-binding-mutable",
+    residualSummary: "test",
+    projection: {
+      kind: "context-projection",
+      frontier: {
+        diagnostics: [],
+        repairs: [],
+        edits: [{
+          path: sourceFile,
+          precondition: { kind: "exact-text", text: precondition },
+          replacement: "",
+        }],
+      },
+    },
+    sourceAnchor: {
+      path: sourceFile,
+      range: { startLine: 1, startCol: 1, endLine: 1, endCol: 4 },
+      sourceHash,
+      status: "active",
+    },
+    lifecycle: {
+      state: "active",
+      supersedes: [],
+      supersededBy: null,
+    },
+    hash: "",
+  };
+  node.hash = contextNodeHash(node);
+  return node;
+}
+
 function writeComplianceNode(ctxDir, node, filenameHash = node.hash) {
   mkdirSync(join(ctxDir, "nodes"), { recursive: true });
   const nodeFile = join(ctxDir, "nodes", `${filenameHash.replace("sha256:", "")}.json`);
@@ -1168,8 +1207,8 @@ function makeVerifyNode(sourceFile, sourceHash, precondition = "let") {
   const ctxDir = join(outDir, "context-compliance-nodes-clean-fixture");
   rmSync(ctxDir, { recursive: true, force: true });
   mkdirSync(ctxDir, { recursive: true });
-  const activeA = makeComplianceNode("ctx:node:active-a", "active", "a.0");
-  const activeB = makeComplianceNode("ctx:node:active-b", "active", "b.0");
+  const activeA = makeComplianceNode("ctx:node:active-a", "active");
+  const activeB = makeComplianceNode("ctx:node:active-b", "active");
   const superseded = makeComplianceNode("ctx:node:superseded", "superseded");
   const root = makeComplianceRoot(ctxDir, null, {
     activeNodes: [activeA.hash, activeB.hash],
@@ -1289,6 +1328,157 @@ function makeVerifyNode(sourceFile, sourceHash, precondition = "let") {
     assert.equal(result.body.ok, false);
     assert.equal(result.body.nodes.lifecycleOk, false);
     assert.equal(result.body.diagnostics.some((diagnostic) => diagnostic.code === "CTX_COMPLIANCE_ACTIVE_NODE_SUPERSEDED"), true);
+    assert.equal(result.code, 1);
+  } finally {
+    rmSync(ctxDir, { recursive: true, force: true });
+  }
+}
+
+{
+  const ctxDir = join(outDir, "context-compliance-anchors-clean-fixture");
+  const sourceFile = join(ctxDir, "anchor-clean.0");
+  rmSync(ctxDir, { recursive: true, force: true });
+  mkdirSync(ctxDir, { recursive: true });
+  writeFileSync(sourceFile, "let value = 1\n");
+  const node = makeComplianceAnchorNode("ctx:node:anchor-clean", sourceFile, sha256Text("let value = 1\n"));
+  const root = makeComplianceRoot(ctxDir, null, {
+    activeNodes: [node.hash],
+    nodes: [node.hash],
+  });
+  writeCompliancePointer(ctxDir, root.contextRoot);
+  writeComplianceRootSnapshot(ctxDir, root);
+  writeComplianceSourceIndex(ctxDir, { [sourceFile]: [node.hash] });
+  writeComplianceNode(ctxDir, node);
+  try {
+    const result = json(["context", "compliance", "--json"], { env: { ZERO_CONTEXT_DIR: ctxDir } });
+    assert.equal(result.body.ok, true);
+    assert.equal(result.body.anchors.checked, 1);
+    assert.equal(result.body.anchors.ok, true);
+    assert.equal(result.body.indexes.sourceIndexOk, true);
+    assert.deepEqual(result.body.diagnostics, []);
+    assert.equal(result.code, 0);
+  } finally {
+    rmSync(ctxDir, { recursive: true, force: true });
+  }
+}
+
+{
+  const ctxDir = join(outDir, "context-compliance-anchors-source-missing-fixture");
+  const sourceFile = join(ctxDir, "missing.0");
+  rmSync(ctxDir, { recursive: true, force: true });
+  mkdirSync(ctxDir, { recursive: true });
+  const node = makeComplianceAnchorNode("ctx:node:anchor-missing", sourceFile, null);
+  const root = makeComplianceRoot(ctxDir, null, {
+    activeNodes: [node.hash],
+    nodes: [node.hash],
+  });
+  writeCompliancePointer(ctxDir, root.contextRoot);
+  writeComplianceRootSnapshot(ctxDir, root);
+  writeComplianceSourceIndex(ctxDir, { [sourceFile]: [node.hash] });
+  writeComplianceNode(ctxDir, node);
+  try {
+    const result = json(["context", "compliance", "--json"], { allowFailure: true, env: { ZERO_CONTEXT_DIR: ctxDir } });
+    assert.equal(result.body.ok, false);
+    assert.equal(result.body.anchors.checked, 1);
+    assert.equal(result.body.anchors.ok, false);
+    assert.equal(result.body.diagnostics.some((diagnostic) => diagnostic.code === "CTX_SOURCE_MISSING"), true);
+    assert.equal(result.code, 1);
+  } finally {
+    rmSync(ctxDir, { recursive: true, force: true });
+  }
+}
+
+{
+  const ctxDir = join(outDir, "context-compliance-anchors-hash-mismatch-fixture");
+  const sourceFile = join(ctxDir, "anchor-hash.0");
+  rmSync(ctxDir, { recursive: true, force: true });
+  mkdirSync(ctxDir, { recursive: true });
+  writeFileSync(sourceFile, "let value = 1\n");
+  const node = makeComplianceAnchorNode("ctx:node:anchor-hash", sourceFile, "sha256:0000000000000000000000000000000000000000000000000000000000000000");
+  const root = makeComplianceRoot(ctxDir, null, {
+    activeNodes: [node.hash],
+    nodes: [node.hash],
+  });
+  writeCompliancePointer(ctxDir, root.contextRoot);
+  writeComplianceRootSnapshot(ctxDir, root);
+  writeComplianceSourceIndex(ctxDir, { [sourceFile]: [node.hash] });
+  writeComplianceNode(ctxDir, node);
+  try {
+    const result = json(["context", "compliance", "--json"], { allowFailure: true, env: { ZERO_CONTEXT_DIR: ctxDir } });
+    assert.equal(result.body.ok, false);
+    assert.equal(result.body.anchors.ok, false);
+    assert.equal(result.body.diagnostics.some((diagnostic) => diagnostic.code === "CTX_SOURCE_HASH_MISMATCH"), true);
+    assert.equal(result.code, 1);
+  } finally {
+    rmSync(ctxDir, { recursive: true, force: true });
+  }
+}
+
+{
+  const ctxDir = join(outDir, "context-compliance-source-index-points-to-superseded-fixture");
+  const sourceFile = "superseded.0";
+  rmSync(ctxDir, { recursive: true, force: true });
+  mkdirSync(ctxDir, { recursive: true });
+  const node = makeComplianceNode("ctx:node:index-superseded", "superseded");
+  const root = makeComplianceRoot(ctxDir, null, {
+    supersededNodes: [node.hash],
+  });
+  writeCompliancePointer(ctxDir, root.contextRoot);
+  writeComplianceRootSnapshot(ctxDir, root);
+  writeComplianceSourceIndex(ctxDir, { [sourceFile]: [node.hash] });
+  writeComplianceNode(ctxDir, node);
+  try {
+    const result = json(["context", "compliance", "--json"], { allowFailure: true, env: { ZERO_CONTEXT_DIR: ctxDir } });
+    assert.equal(result.body.ok, false);
+    assert.equal(result.body.indexes.sourceIndexOk, false);
+    assert.equal(result.body.diagnostics.some((diagnostic) => diagnostic.code === "CTX_COMPLIANCE_SOURCE_INDEX_POINTS_TO_SUPERSEDED"), true);
+    assert.equal(result.code, 1);
+  } finally {
+    rmSync(ctxDir, { recursive: true, force: true });
+  }
+}
+
+{
+  const ctxDir = join(outDir, "context-compliance-source-index-stale-reverse-fixture");
+  const sourceFile = join(ctxDir, "stale-reverse.0");
+  rmSync(ctxDir, { recursive: true, force: true });
+  mkdirSync(ctxDir, { recursive: true });
+  writeFileSync(sourceFile, "let value = 1\n");
+  const node = makeComplianceAnchorNode("ctx:node:index-stale-reverse", sourceFile, null);
+  const root = makeComplianceRoot(ctxDir, null, {
+    activeNodes: [node.hash],
+    nodes: [node.hash],
+  });
+  writeCompliancePointer(ctxDir, root.contextRoot);
+  writeComplianceRootSnapshot(ctxDir, root);
+  writeComplianceSourceIndex(ctxDir, {});
+  writeComplianceNode(ctxDir, node);
+  try {
+    const result = json(["context", "compliance", "--json"], { allowFailure: true, env: { ZERO_CONTEXT_DIR: ctxDir } });
+    assert.equal(result.body.ok, false);
+    assert.equal(result.body.indexes.sourceIndexOk, false);
+    assert.equal(result.body.diagnostics.some((diagnostic) => diagnostic.code === "CTX_COMPLIANCE_SOURCE_INDEX_STALE" && diagnostic.message === "source index is missing an active context node"), true);
+    assert.equal(result.code, 1);
+  } finally {
+    rmSync(ctxDir, { recursive: true, force: true });
+  }
+}
+
+{
+  const ctxDir = join(outDir, "context-compliance-source-index-malformed-fixture");
+  rmSync(ctxDir, { recursive: true, force: true });
+  mkdirSync(ctxDir, { recursive: true });
+  const root = makeComplianceRoot(ctxDir);
+  writeCompliancePointer(ctxDir, root.contextRoot);
+  writeComplianceRootSnapshot(ctxDir, root);
+  mkdirSync(join(ctxDir, "indexes"), { recursive: true });
+  writeFileSync(join(ctxDir, "indexes", "source-index.json"), "not json");
+  try {
+    const result = json(["context", "compliance", "--json"], { allowFailure: true, env: { ZERO_CONTEXT_DIR: ctxDir } });
+    assert.equal(result.body.ok, false);
+    assert.equal(result.body.indexes.sourceIndexOk, false);
+    assert.equal(result.body.diagnostics.some((diagnostic) => diagnostic.code === "CTX_COMPLIANCE_SOURCE_INDEX_MALFORMED"), true);
+    assert.equal(result.body.diagnostics.some((diagnostic) => diagnostic.code === "CTX_COMPLIANCE_SOURCE_INDEX_MISSING"), false);
     assert.equal(result.code, 1);
   } finally {
     rmSync(ctxDir, { recursive: true, force: true });

@@ -9489,7 +9489,7 @@ static bool context_read_source_range(const char *anchor_json, ContextSourceRang
   return ok;
 }
 
-static char *context_extract_range_text(const char *source, size_t source_len, const ContextSourceRange *range, char **actual) {
+static char *context_verify_extract_range_text(const char *source, size_t source_len, const ContextSourceRange *range, char **actual) {
   *actual = NULL;
   if (!range->column_unit || strcmp(range->column_unit, "utf8-byte") != 0) {
     *actual = z_strdup("unsupported columnUnit");
@@ -9721,7 +9721,7 @@ static int context_verify_command(const Command *command) {
         ContextSourceRange range;
         if (context_read_source_range(source_anchor.data, &range)) {
           char *range_actual = NULL;
-          extracted_text = context_extract_range_text(source, source_len, &range, &range_actual);
+          extracted_text = context_verify_extract_range_text(source, source_len, &range, &range_actual);
           if (!extracted_text) {
             context_verify_append_diagnostic(&diagnostics, &diagnostic_count, "CTX_ANCHOR_RANGE_INVALID", "error", node_id, "source anchor range is invalid", anchor_path, NULL, NULL, range_actual);
           } else {
@@ -9831,14 +9831,16 @@ static void context_compliance_append_nodes_section(ZBuf *out, const ContextComp
   zbuf_append(out, "\n  }");
 }
 
-static void context_compliance_append_anchor_index_stubs(ZBuf *out, bool source_index_ok) {
-  zbuf_append(out,
-    ",\n  \"anchors\": {\n"
-    "    \"checked\": 0,\n"
-    "    \"ok\": true\n"
-    "  },\n"
-    "  \"indexes\": {\n"
-    "    \"sourceIndexOk\": ");
+static void context_compliance_append_anchors_section(ZBuf *out, const ContextComplianceAnchorState *anchors) {
+  zbuf_append(out, ",\n  \"anchors\": {\n    \"checked\": ");
+  zbuf_appendf(out, "%zu", anchors ? anchors->checked : 0);
+  zbuf_append(out, ",\n    \"ok\": ");
+  zbuf_append(out, !anchors || anchors->ok ? "true" : "false");
+  zbuf_append(out, "\n  }");
+}
+
+static void context_compliance_append_indexes_section(ZBuf *out, bool source_index_ok) {
+  zbuf_append(out, ",\n  \"indexes\": {\n    \"sourceIndexOk\": ");
   zbuf_append(out, source_index_ok ? "true" : "false");
   zbuf_append(out, "\n  }");
 }
@@ -9868,21 +9870,29 @@ static int context_compliance_command(const Command *command) {
     context_compliance_read_nodes(storage, root_state.current_root_snapshot_json, &node_state, &diagnostics, &diagnostic_count);
   }
 
+  ContextComplianceAnchorState anchor_state;
+  context_compliance_anchor_state_init(&anchor_state);
+  if (root_state.current_root_snapshot_json) {
+    context_compliance_read_anchors(storage, source_option, &node_state, &anchor_state, &diagnostics, &diagnostic_count);
+  }
+
+  ContextSourceIndexState index_state;
+  memset(&index_state, 0, sizeof(index_state));
   bool source_index_ok = true;
-  char *source_index_path = context_source_index_path(storage);
-  if (root_state.current_root_snapshot_json && (!source_index_path || !path_exists(source_index_path))) {
-    source_index_ok = false;
-    context_diagnostic_append(
-      &diagnostics,
-      &diagnostic_count,
-      NULL,
-      "CTX_COMPLIANCE_SOURCE_INDEX_MISSING",
-      "source index does not exist",
-      NULL,
-      NULL,
-      source_index_path,
-      NULL,
-      NULL);
+  if (root_state.current_root_snapshot_json) {
+    context_compliance_read_source_index(storage, &index_state, &diagnostics, &diagnostic_count);
+    source_index_ok = index_state.exists && !index_state.malformed;
+    if (source_index_ok) {
+      context_compliance_check_source_index_traversal(
+        &index_state,
+        storage,
+        root_state.current_root_snapshot_json,
+        source_option,
+        &node_state,
+        &source_index_ok,
+        &diagnostics,
+        &diagnostic_count);
+    }
   }
 
   bool ok = diagnostic_count == 0;
@@ -9903,7 +9913,8 @@ static int context_compliance_command(const Command *command) {
   zbuf_appendf(&out, ",\n    \"rootDepth\": %zu\n  }", root_state.root_depth);
   context_compliance_append_timeline_section(&out, &timeline_state);
   context_compliance_append_nodes_section(&out, &node_state);
-  context_compliance_append_anchor_index_stubs(&out, source_index_ok);
+  context_compliance_append_anchors_section(&out, &anchor_state);
+  context_compliance_append_indexes_section(&out, source_index_ok);
   zbuf_append(&out, ",\n  \"diagnostics\": ");
   if (diagnostic_count > 0) {
     zbuf_append(&out, "[");
@@ -9917,9 +9928,9 @@ static int context_compliance_command(const Command *command) {
 
   zbuf_free(&out);
   zbuf_free(&diagnostics);
+  context_source_index_state_free(&index_state);
   context_compliance_node_state_free(&node_state);
   context_compliance_root_state_free(&root_state);
-  free(source_index_path);
   return ok ? 0 : 1;
 }
 

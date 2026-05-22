@@ -235,6 +235,81 @@ static char *valid_node_json(const char *node_id, const char *anchor_path, const
   return node;
 }
 
+static char *anchor_node_json(
+  const char *node_id,
+  const char *hash,
+  const char *anchor_path,
+  const char *source_hash,
+  int start_line,
+  int start_col,
+  int end_line,
+  int end_col,
+  const char *precondition,
+  const char *lifecycle_state) {
+  ZBuf json;
+  zbuf_init(&json);
+  zbuf_append(&json, "{\"schemaVersion\":1,\"kind\":\"repair-memory\",\"nodeId\":\"");
+  zbuf_append(&json, node_id);
+  zbuf_append(&json, "\",\"hash\":\"");
+  zbuf_append(&json, hash);
+  zbuf_append(&json, "\",\"parents\":[],\"codes\":[],\"diagnosticCode\":\"TYP009\",\"repairId\":\"make-binding-mutable\",\"residualSummary\":\"test\",\"projection\":{\"kind\":\"context-projection\",\"frontier\":{\"diagnostics\":[],\"repairs\":[],\"edits\":");
+  if (precondition) {
+    zbuf_append(&json, "[{\"path\":\"");
+    zbuf_append(&json, anchor_path);
+    zbuf_append(&json, "\",\"precondition\":{\"kind\":\"exact-text\",\"text\":\"");
+    zbuf_append(&json, precondition);
+    zbuf_append(&json, "\"},\"replacement\":\"\"}]");
+  } else {
+    zbuf_append(&json, "[]");
+  }
+  zbuf_append(&json, "}},\"sourceAnchor\":{\"path\":\"");
+  zbuf_append(&json, anchor_path);
+  zbuf_append(&json, "\",\"range\":{\"startLine\":");
+  zbuf_appendf(&json, "%d", start_line);
+  zbuf_append(&json, ",\"startCol\":");
+  zbuf_appendf(&json, "%d", start_col);
+  zbuf_append(&json, ",\"endLine\":");
+  zbuf_appendf(&json, "%d", end_line);
+  zbuf_append(&json, ",\"endCol\":");
+  zbuf_appendf(&json, "%d", end_col);
+  zbuf_append(&json, "},\"sourceHash\":");
+  if (source_hash) {
+    zbuf_append_char(&json, '"');
+    zbuf_append(&json, source_hash);
+    zbuf_append_char(&json, '"');
+  } else {
+    zbuf_append(&json, "null");
+  }
+  zbuf_append(&json, ",\"status\":\"active\"}");
+  if (lifecycle_state) {
+    zbuf_append(&json, ",\"lifecycle\":{\"state\":\"");
+    zbuf_append(&json, lifecycle_state);
+    zbuf_append(&json, "\",\"supersedes\":[],\"supersededBy\":null}");
+  }
+  zbuf_append_char(&json, '}');
+  return json.data;
+}
+
+static char *valid_anchor_node_json(
+  const char *node_id,
+  const char *anchor_path,
+  const char *source_hash,
+  int start_line,
+  int start_col,
+  int end_line,
+  int end_col,
+  const char *precondition,
+  char **out_node_hash) {
+  char *draft = anchor_node_json(node_id, "sha256:placeholder", anchor_path, source_hash, start_line, start_col, end_line, end_col, precondition, "active");
+  char *hash = context_node_hash(draft);
+  free(draft);
+  ASSERT(hash != NULL, "compute anchor node hash");
+  char *node = anchor_node_json(node_id, hash, anchor_path, source_hash, start_line, start_col, end_line, end_col, precondition, "active");
+  if (out_node_hash) *out_node_hash = hash;
+  else free(hash);
+  return node;
+}
+
 static void make_node_storage_dirs(const char *base, char *storage, size_t storage_len, char *nodes, size_t nodes_len) {
   snprintf(storage, storage_len, "%s/storage", base);
   snprintf(nodes, nodes_len, "%s/nodes", storage);
@@ -259,6 +334,27 @@ static void cleanup_node_storage(const char *base, const char **node_paths, size
   snprintf(path, sizeof(path), "%s/storage", base);
   rmdir(path);
   rmdir(base);
+}
+
+static void make_index_storage_dirs(const char *base, char *storage, size_t storage_len, char *nodes, size_t nodes_len, char *indexes, size_t indexes_len) {
+  make_node_storage_dirs(base, storage, storage_len, nodes, nodes_len);
+  snprintf(indexes, indexes_len, "%s/indexes", storage);
+  ASSERT(mkdir(indexes, 0700) == 0, "mkdir indexes");
+}
+
+static void write_source_index_json(const char *storage, const char *json) {
+  char *path = context_source_index_path(storage);
+  write_text_file(path, json);
+  free(path);
+}
+
+static void cleanup_index_storage(const char *base, const char **node_paths, size_t node_count) {
+  char path[256];
+  snprintf(path, sizeof(path), "%s/storage/indexes/source-index.json", base);
+  unlink(path);
+  snprintf(path, sizeof(path), "%s/storage/indexes", base);
+  rmdir(path);
+  cleanup_node_storage(base, node_paths, node_count);
 }
 
 static void lifecycle_defaults_to_active_when_absent(void) {
@@ -1031,6 +1127,288 @@ static void compliance_nodes_superseded_missing(void) {
   free(snapshot);
 }
 
+static void compliance_anchors_clean(void) {
+  char base[128], storage[160], nodes_dir[192], source_path[224];
+  snprintf(base, sizeof(base), "/tmp/zero-context-smoke-%ld-anchor1", (long)getpid());
+  make_node_storage_dirs(base, storage, sizeof(storage), nodes_dir, sizeof(nodes_dir));
+  snprintf(source_path, sizeof(source_path), "%s/source.0", base);
+  write_text_file(source_path, "let value\n");
+  char *source_hash = context_source_file_hash(source_path);
+  char *hash = NULL;
+  char *node = valid_anchor_node_json("ctx:node:anchor-clean", source_path, source_hash, 1, 1, 1, 4, "let", &hash);
+  char *path = write_node_at(storage, hash, node);
+  const char *active_hashes[] = {hash};
+  char *snapshot = node_root_snapshot_json(active_hashes, 1, NULL, 0);
+  ZBuf diagnostics; zbuf_init(&diagnostics);
+  size_t diagnostic_count = 0;
+  ContextComplianceNodeState node_state;
+  context_compliance_read_nodes(storage, snapshot, &node_state, &diagnostics, &diagnostic_count);
+  ContextComplianceAnchorState anchor_state;
+  context_compliance_read_anchors(storage, NULL, &node_state, &anchor_state, &diagnostics, &diagnostic_count);
+  ASSERT(anchor_state.checked == 1, "clean anchor checked count");
+  ASSERT(anchor_state.ok, "clean anchor ok");
+  ASSERT(diagnostic_count == 0, "clean anchor diagnostics");
+  context_compliance_node_state_free(&node_state);
+  zbuf_free(&diagnostics);
+  unlink(source_path);
+  const char *paths[] = {path};
+  cleanup_node_storage(base, paths, 1);
+  free(source_hash); free(hash); free(node); free(path); free(snapshot);
+}
+
+static void compliance_anchors_source_missing(void) {
+  char base[128], storage[160], nodes_dir[192], source_path[224];
+  snprintf(base, sizeof(base), "/tmp/zero-context-smoke-%ld-anchor2", (long)getpid());
+  make_node_storage_dirs(base, storage, sizeof(storage), nodes_dir, sizeof(nodes_dir));
+  snprintf(source_path, sizeof(source_path), "%s/missing.0", base);
+  char *hash = NULL;
+  char *node = valid_anchor_node_json("ctx:node:anchor-missing", source_path, NULL, 1, 1, 1, 4, "let", &hash);
+  char *path = write_node_at(storage, hash, node);
+  const char *active_hashes[] = {hash};
+  char *snapshot = node_root_snapshot_json(active_hashes, 1, NULL, 0);
+  ZBuf diagnostics; zbuf_init(&diagnostics);
+  size_t diagnostic_count = 0;
+  ContextComplianceNodeState node_state;
+  context_compliance_read_nodes(storage, snapshot, &node_state, &diagnostics, &diagnostic_count);
+  ContextComplianceAnchorState anchor_state;
+  context_compliance_read_anchors(storage, NULL, &node_state, &anchor_state, &diagnostics, &diagnostic_count);
+  ASSERT(anchor_state.checked == 1, "missing source anchor checked count");
+  ASSERT(!anchor_state.ok, "missing source anchor false");
+  ASSERT(strstr(diagnostics.data, "\"code\":\"CTX_SOURCE_MISSING\"") != NULL, "missing source diagnostic");
+  context_compliance_node_state_free(&node_state);
+  zbuf_free(&diagnostics);
+  const char *paths[] = {path};
+  cleanup_node_storage(base, paths, 1);
+  free(hash); free(node); free(path); free(snapshot);
+}
+
+static void compliance_anchors_hash_mismatch(void) {
+  char base[128], storage[160], nodes_dir[192], source_path[224];
+  snprintf(base, sizeof(base), "/tmp/zero-context-smoke-%ld-anchor3", (long)getpid());
+  make_node_storage_dirs(base, storage, sizeof(storage), nodes_dir, sizeof(nodes_dir));
+  snprintf(source_path, sizeof(source_path), "%s/source.0", base);
+  write_text_file(source_path, "let value\n");
+  const char *wrong_hash = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+  char *hash = NULL;
+  char *node = valid_anchor_node_json("ctx:node:anchor-hash", source_path, wrong_hash, 1, 1, 1, 4, "let", &hash);
+  char *path = write_node_at(storage, hash, node);
+  const char *active_hashes[] = {hash};
+  char *snapshot = node_root_snapshot_json(active_hashes, 1, NULL, 0);
+  ZBuf diagnostics; zbuf_init(&diagnostics);
+  size_t diagnostic_count = 0;
+  ContextComplianceNodeState node_state;
+  context_compliance_read_nodes(storage, snapshot, &node_state, &diagnostics, &diagnostic_count);
+  ContextComplianceAnchorState anchor_state;
+  context_compliance_read_anchors(storage, NULL, &node_state, &anchor_state, &diagnostics, &diagnostic_count);
+  ASSERT(!anchor_state.ok, "source hash mismatch anchor false");
+  ASSERT(strstr(diagnostics.data, "\"code\":\"CTX_SOURCE_HASH_MISMATCH\"") != NULL, "source hash mismatch diagnostic");
+  context_compliance_node_state_free(&node_state);
+  zbuf_free(&diagnostics);
+  unlink(source_path);
+  const char *paths[] = {path};
+  cleanup_node_storage(base, paths, 1);
+  free(hash); free(node); free(path); free(snapshot);
+}
+
+static void compliance_anchors_range_invalid(void) {
+  char base[128], storage[160], nodes_dir[192], source_path[224];
+  snprintf(base, sizeof(base), "/tmp/zero-context-smoke-%ld-anchor4", (long)getpid());
+  make_node_storage_dirs(base, storage, sizeof(storage), nodes_dir, sizeof(nodes_dir));
+  snprintf(source_path, sizeof(source_path), "%s/source.0", base);
+  write_text_file(source_path, "let value\n");
+  char *source_hash = context_source_file_hash(source_path);
+  char *hash = NULL;
+  char *node = valid_anchor_node_json("ctx:node:anchor-range", source_path, source_hash, 999, 1, 999, 2, "let", &hash);
+  char *path = write_node_at(storage, hash, node);
+  const char *active_hashes[] = {hash};
+  char *snapshot = node_root_snapshot_json(active_hashes, 1, NULL, 0);
+  ZBuf diagnostics; zbuf_init(&diagnostics);
+  size_t diagnostic_count = 0;
+  ContextComplianceNodeState node_state;
+  context_compliance_read_nodes(storage, snapshot, &node_state, &diagnostics, &diagnostic_count);
+  ContextComplianceAnchorState anchor_state;
+  context_compliance_read_anchors(storage, NULL, &node_state, &anchor_state, &diagnostics, &diagnostic_count);
+  ASSERT(!anchor_state.ok, "range invalid anchor false");
+  ASSERT(strstr(diagnostics.data, "\"code\":\"CTX_ANCHOR_RANGE_INVALID\"") != NULL, "range invalid diagnostic");
+  context_compliance_node_state_free(&node_state);
+  zbuf_free(&diagnostics);
+  unlink(source_path);
+  const char *paths[] = {path};
+  cleanup_node_storage(base, paths, 1);
+  free(source_hash); free(hash); free(node); free(path); free(snapshot);
+}
+
+static void compliance_anchors_precondition_mismatch(void) {
+  char base[128], storage[160], nodes_dir[192], source_path[224];
+  snprintf(base, sizeof(base), "/tmp/zero-context-smoke-%ld-anchor5", (long)getpid());
+  make_node_storage_dirs(base, storage, sizeof(storage), nodes_dir, sizeof(nodes_dir));
+  snprintf(source_path, sizeof(source_path), "%s/source.0", base);
+  write_text_file(source_path, "let value\n");
+  char *source_hash = context_source_file_hash(source_path);
+  char *hash = NULL;
+  char *node = valid_anchor_node_json("ctx:node:anchor-precondition", source_path, source_hash, 1, 1, 1, 4, "var", &hash);
+  char *path = write_node_at(storage, hash, node);
+  const char *active_hashes[] = {hash};
+  char *snapshot = node_root_snapshot_json(active_hashes, 1, NULL, 0);
+  ZBuf diagnostics; zbuf_init(&diagnostics);
+  size_t diagnostic_count = 0;
+  ContextComplianceNodeState node_state;
+  context_compliance_read_nodes(storage, snapshot, &node_state, &diagnostics, &diagnostic_count);
+  ContextComplianceAnchorState anchor_state;
+  context_compliance_read_anchors(storage, NULL, &node_state, &anchor_state, &diagnostics, &diagnostic_count);
+  ASSERT(!anchor_state.ok, "precondition mismatch anchor false");
+  ASSERT(strstr(diagnostics.data, "\"code\":\"CTX_PRECONDITION_MISMATCH\"") != NULL, "precondition mismatch diagnostic");
+  context_compliance_node_state_free(&node_state);
+  zbuf_free(&diagnostics);
+  unlink(source_path);
+  const char *paths[] = {path};
+  cleanup_node_storage(base, paths, 1);
+  free(source_hash); free(hash); free(node); free(path); free(snapshot);
+}
+
+static void compliance_anchors_source_filter(void) {
+  char base[128], storage[160], nodes_dir[192], source_a[224], source_b[224];
+  snprintf(base, sizeof(base), "/tmp/zero-context-smoke-%ld-anchor6", (long)getpid());
+  make_node_storage_dirs(base, storage, sizeof(storage), nodes_dir, sizeof(nodes_dir));
+  snprintf(source_a, sizeof(source_a), "%s/a.0", base);
+  snprintf(source_b, sizeof(source_b), "%s/b.0", base);
+  write_text_file(source_a, "let a\n");
+  char *source_hash = context_source_file_hash(source_a);
+  char *hash_a = NULL, *hash_b = NULL;
+  char *node_a = valid_anchor_node_json("ctx:node:anchor-filter-a", source_a, source_hash, 1, 1, 1, 4, "let", &hash_a);
+  char *node_b = valid_anchor_node_json("ctx:node:anchor-filter-b", source_b, NULL, 1, 1, 1, 4, "let", &hash_b);
+  char *path_a = write_node_at(storage, hash_a, node_a);
+  char *path_b = write_node_at(storage, hash_b, node_b);
+  const char *active_hashes[] = {hash_a, hash_b};
+  char *snapshot = node_root_snapshot_json(active_hashes, 2, NULL, 0);
+  ZBuf diagnostics; zbuf_init(&diagnostics);
+  size_t diagnostic_count = 0;
+  ContextComplianceNodeState node_state;
+  context_compliance_read_nodes(storage, snapshot, &node_state, &diagnostics, &diagnostic_count);
+  ContextComplianceAnchorState anchor_state;
+  context_compliance_read_anchors(storage, source_a, &node_state, &anchor_state, &diagnostics, &diagnostic_count);
+  ASSERT(anchor_state.checked == 1, "anchor source filter checked one");
+  ASSERT(anchor_state.ok, "anchor source filter ok");
+  ASSERT(diagnostic_count == 0, "anchor source filter diagnostics");
+  context_compliance_node_state_free(&node_state);
+  zbuf_free(&diagnostics);
+  unlink(source_a);
+  const char *paths[] = {path_a, path_b};
+  cleanup_node_storage(base, paths, 2);
+  free(source_hash); free(hash_a); free(hash_b); free(node_a); free(node_b); free(path_a); free(path_b); free(snapshot);
+}
+
+static void compliance_source_index_points_to_superseded(void) {
+  char base[128], storage[160], nodes_dir[192], indexes[192];
+  snprintf(base, sizeof(base), "/tmp/zero-context-smoke-%ld-index1", (long)getpid());
+  make_index_storage_dirs(base, storage, sizeof(storage), nodes_dir, sizeof(nodes_dir), indexes, sizeof(indexes));
+  char *hash = NULL;
+  char *node = valid_node_json("ctx:node:index-superseded", NULL, "superseded", &hash);
+  char *path = write_node_at(storage, hash, node);
+  ZBuf index_json; zbuf_init(&index_json);
+  zbuf_append(&index_json, "{\"schemaVersion\":1,\"sources\":{\"source.0\":[\"");
+  zbuf_append(&index_json, hash);
+  zbuf_append(&index_json, "\"]}}");
+  write_source_index_json(storage, index_json.data);
+  const char *superseded_hashes[] = {hash};
+  char *snapshot = node_root_snapshot_json(NULL, 0, superseded_hashes, 1);
+  ZBuf diagnostics; zbuf_init(&diagnostics);
+  size_t diagnostic_count = 0;
+  ContextSourceIndexState index_state;
+  context_compliance_read_source_index(storage, &index_state, &diagnostics, &diagnostic_count);
+  bool source_index_ok = index_state.exists && !index_state.malformed;
+  ContextComplianceNodeState node_state;
+  context_compliance_node_state_init(&node_state);
+  context_compliance_check_source_index_traversal(&index_state, storage, snapshot, NULL, &node_state, &source_index_ok, &diagnostics, &diagnostic_count);
+  ASSERT(!source_index_ok, "superseded index false");
+  ASSERT(strstr(diagnostics.data, "\"code\":\"CTX_COMPLIANCE_SOURCE_INDEX_POINTS_TO_SUPERSEDED\"") != NULL, "superseded index diagnostic");
+  context_source_index_state_free(&index_state);
+  context_compliance_node_state_free(&node_state);
+  zbuf_free(&diagnostics);
+  zbuf_free(&index_json);
+  const char *paths[] = {path};
+  cleanup_index_storage(base, paths, 1);
+  free(hash); free(node); free(path); free(snapshot);
+}
+
+static void compliance_source_index_stale_orphan(void) {
+  char base[128], storage[160], nodes_dir[192], indexes[192];
+  snprintf(base, sizeof(base), "/tmp/zero-context-smoke-%ld-index2", (long)getpid());
+  make_index_storage_dirs(base, storage, sizeof(storage), nodes_dir, sizeof(nodes_dir), indexes, sizeof(indexes));
+  const char *orphan = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa9";
+  ZBuf index_json; zbuf_init(&index_json);
+  zbuf_append(&index_json, "{\"schemaVersion\":1,\"sources\":{\"source.0\":[\"");
+  zbuf_append(&index_json, orphan);
+  zbuf_append(&index_json, "\"]}}");
+  write_source_index_json(storage, index_json.data);
+  char *snapshot = node_root_snapshot_json(NULL, 0, NULL, 0);
+  ZBuf diagnostics; zbuf_init(&diagnostics);
+  size_t diagnostic_count = 0;
+  ContextSourceIndexState index_state;
+  context_compliance_read_source_index(storage, &index_state, &diagnostics, &diagnostic_count);
+  bool source_index_ok = index_state.exists && !index_state.malformed;
+  ContextComplianceNodeState node_state;
+  context_compliance_node_state_init(&node_state);
+  context_compliance_check_source_index_traversal(&index_state, storage, snapshot, NULL, &node_state, &source_index_ok, &diagnostics, &diagnostic_count);
+  ASSERT(!source_index_ok, "orphan index false");
+  ASSERT(strstr(diagnostics.data, "\"code\":\"CTX_COMPLIANCE_SOURCE_INDEX_STALE\"") != NULL, "orphan index diagnostic");
+  ASSERT(strstr(diagnostics.data, "missing or inactive") != NULL, "orphan index message");
+  context_source_index_state_free(&index_state);
+  context_compliance_node_state_free(&node_state);
+  zbuf_free(&diagnostics);
+  zbuf_free(&index_json);
+  cleanup_index_storage(base, NULL, 0);
+  free(snapshot);
+}
+
+static void compliance_source_index_stale_reverse(void) {
+  char base[128], storage[160], nodes_dir[192], indexes[192], source_path[224];
+  snprintf(base, sizeof(base), "/tmp/zero-context-smoke-%ld-index3", (long)getpid());
+  make_index_storage_dirs(base, storage, sizeof(storage), nodes_dir, sizeof(nodes_dir), indexes, sizeof(indexes));
+  snprintf(source_path, sizeof(source_path), "%s/source.0", base);
+  char *hash = NULL;
+  char *node = valid_anchor_node_json("ctx:node:index-reverse", source_path, NULL, 1, 1, 1, 2, NULL, &hash);
+  char *path = write_node_at(storage, hash, node);
+  write_source_index_json(storage, "{\"schemaVersion\":1,\"sources\":{}}");
+  const char *active_hashes[] = {hash};
+  char *snapshot = node_root_snapshot_json(active_hashes, 1, NULL, 0);
+  ZBuf diagnostics; zbuf_init(&diagnostics);
+  size_t diagnostic_count = 0;
+  ContextComplianceNodeState node_state;
+  context_compliance_read_nodes(storage, snapshot, &node_state, &diagnostics, &diagnostic_count);
+  ContextSourceIndexState index_state;
+  context_compliance_read_source_index(storage, &index_state, &diagnostics, &diagnostic_count);
+  bool source_index_ok = index_state.exists && !index_state.malformed;
+  context_compliance_check_source_index_traversal(&index_state, storage, snapshot, NULL, &node_state, &source_index_ok, &diagnostics, &diagnostic_count);
+  ASSERT(!source_index_ok, "reverse index false");
+  ASSERT(strstr(diagnostics.data, "\"code\":\"CTX_COMPLIANCE_SOURCE_INDEX_STALE\"") != NULL, "reverse index diagnostic");
+  ASSERT(strstr(diagnostics.data, "missing an active context node") != NULL, "reverse index message");
+  context_source_index_state_free(&index_state);
+  context_compliance_node_state_free(&node_state);
+  zbuf_free(&diagnostics);
+  const char *paths[] = {path};
+  cleanup_index_storage(base, paths, 1);
+  free(hash); free(node); free(path); free(snapshot);
+}
+
+static void compliance_source_index_malformed(void) {
+  char base[128], storage[160], nodes_dir[192], indexes[192];
+  snprintf(base, sizeof(base), "/tmp/zero-context-smoke-%ld-index4", (long)getpid());
+  make_index_storage_dirs(base, storage, sizeof(storage), nodes_dir, sizeof(nodes_dir), indexes, sizeof(indexes));
+  write_source_index_json(storage, "not json");
+  ZBuf diagnostics; zbuf_init(&diagnostics);
+  size_t diagnostic_count = 0;
+  ContextSourceIndexState index_state;
+  context_compliance_read_source_index(storage, &index_state, &diagnostics, &diagnostic_count);
+  ASSERT(index_state.exists, "malformed index exists");
+  ASSERT(index_state.malformed, "malformed index state");
+  ASSERT(strstr(diagnostics.data, "\"code\":\"CTX_COMPLIANCE_SOURCE_INDEX_MALFORMED\"") != NULL, "malformed index diagnostic");
+  ASSERT(strstr(diagnostics.data, "CTX_COMPLIANCE_SOURCE_INDEX_MISSING") == NULL, "malformed index not missing");
+  context_source_index_state_free(&index_state);
+  zbuf_free(&diagnostics);
+  cleanup_index_storage(base, NULL, 0);
+}
+
 int main(void) {
   lifecycle_defaults_to_active_when_absent();
   lifecycle_defaults_to_active_when_state_absent();
@@ -1063,6 +1441,16 @@ int main(void) {
   compliance_nodes_filename_mismatch();
   compliance_nodes_superseded_active();
   compliance_nodes_superseded_missing();
+  compliance_anchors_clean();
+  compliance_anchors_source_missing();
+  compliance_anchors_hash_mismatch();
+  compliance_anchors_range_invalid();
+  compliance_anchors_precondition_mismatch();
+  compliance_anchors_source_filter();
+  compliance_source_index_points_to_superseded();
+  compliance_source_index_stale_orphan();
+  compliance_source_index_stale_reverse();
+  compliance_source_index_malformed();
   printf("context smoke ok\n");
   return 0;
 }

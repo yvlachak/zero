@@ -69,6 +69,27 @@ typedef struct {
   size_t active_node_anchor_count;
 } ContextComplianceNodeState;
 
+typedef struct {
+  bool ok;
+  char *text;
+  char *actual;
+} ContextRangeExtract;
+
+typedef struct {
+  size_t checked;
+  bool ok;
+} ContextComplianceAnchorState;
+
+typedef struct {
+  bool exists;
+  bool malformed;
+  char *json;
+  char **paths;
+  char ***hashes_per_path;
+  size_t *hash_counts;
+  size_t path_count;
+} ContextSourceIndexState;
+
 void context_compliance_root_state_free(ContextComplianceRootState *state);
 void context_compliance_read_root(
   const char *storage,
@@ -88,6 +109,44 @@ void context_compliance_read_nodes(
   const char *storage,
   const char *root_snapshot_json,
   ContextComplianceNodeState *state,
+  ZBuf *diagnostics,
+  size_t *diagnostic_count);
+void context_range_extract_free(ContextRangeExtract *result);
+ContextRangeExtract context_extract_range_text(
+  const char *source_bytes,
+  size_t source_len,
+  int start_line,
+  int start_col,
+  int end_line,
+  int end_col);
+char *context_source_file_hash(const char *source_path);
+bool context_compliance_verify_node_anchor(
+  const char *node_json,
+  const char *node_id,
+  const char *node_hash,
+  ZBuf *diagnostics,
+  size_t *diagnostic_count);
+void context_compliance_anchor_state_init(ContextComplianceAnchorState *state);
+void context_compliance_read_anchors(
+  const char *storage,
+  const char *source_option,
+  const ContextComplianceNodeState *nodes,
+  ContextComplianceAnchorState *state,
+  ZBuf *diagnostics,
+  size_t *diagnostic_count);
+void context_source_index_state_free(ContextSourceIndexState *state);
+void context_compliance_read_source_index(
+  const char *storage,
+  ContextSourceIndexState *state,
+  ZBuf *diagnostics,
+  size_t *diagnostic_count);
+void context_compliance_check_source_index_traversal(
+  const ContextSourceIndexState *index,
+  const char *storage,
+  const char *root_snapshot_json,
+  const char *source_option,
+  const ContextComplianceNodeState *nodes,
+  bool *out_source_index_ok,
   ZBuf *diagnostics,
   size_t *diagnostic_count);
 
